@@ -10,3 +10,6 @@ __pycache__/
 backend/extraction_result.json
 backend/captures/
 backend/samples/
+backend/truth/
+backend/*_result*.json
+backend/report_*.json

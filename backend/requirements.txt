@@ -1,0 +1,4 @@
+anthropic>=0.121
+pydantic>=2.0
+pillow>=10.0
+python-dotenv>=1.0
