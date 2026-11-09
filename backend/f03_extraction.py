@@ -33,6 +33,7 @@ load_dotenv()  # backend/.env 가 있으면 환경변수로 올림. 없으면 �
 import argparse
 import asyncio
 import base64
+import hashlib
 import re
 import io
 import os
@@ -64,7 +65,7 @@ log = logging.getLogger("f03")
 # ---------------------------------------------------------------------------
 
 MODEL = os.environ.get("F03_MODEL", "claude-sonnet-5-5")  # .env 의 F03_MODEL 로 교체 가능. 평가 세트로 claude-opus-5-5 와 비교 예정
-EXTRACTOR_VERSION = "f03-0.5"           # 코드 변경 시 올림. 결과에 기록해 재추출 비교에 사용
+EXTRACTOR_VERSION = "f03-0.7"           # 코드 변경 시 올림. 결과에 기록해 재추출 비교에 사용
 PROMPT_VERSION = "p3"                   # SYSTEM_PROMPT 수정 시 올림 (p1, p2, ...)
 EFFORT = "low"                       # 추출은 깊은 추론이 필요 없어서 low. 품질이 부족하면 medium
 MAX_TOKENS = 8000                    # 캡처 1장 = 보통 15행 안팎. 사고 토큰도 여기 포함되므로 여유 있게
@@ -132,8 +133,10 @@ def _check_date_shape(v: str) -> str:
     if v == "":
         return v
     parts = v.split("-")
-    if len(parts) not in (1, 2, 3) or not all(p.isdigit() for p in parts):
-        raise ValueError(f"date must be '', DD, MM-DD or YYYY-MM-DD, got {v!r}")
+    # isascii 를 함께 보는 이유: str.isdigit() 은 "²" 같은 유니코드 숫자도 True 라서 int() 에서 터집니다.
+    if len(parts) not in (1, 2, 3) or not all(p.isascii() and p.isdigit() for p in parts):
+        # 메시지에 입력값을 넣지 않습니다 (오류 문자열이 error_message 로 저장되므로 원문이 새지 않게)
+        raise ValueError("date must be '', DD, MM-DD or YYYY-MM-DD")
     return v
 
 
@@ -239,7 +242,9 @@ class TransactionCandidate:
     kind: str
     confidence: str                # high / medium / low (모델 참고값. 화면에 정확도로 표시하지 않음)
     raw_text: str
-    flags: list[str] = field(default_factory=list)   # "month_mismatch", "low_confidence", "unknown_direction", "date_missing"
+    flags: list[str] = field(default_factory=list)
+    # F04 검토 큐 게이트 대상: date_missing, merchant_missing(필수값 누락) / low_confidence / month_mismatch / unknown_direction
+    # 정보성(게이트 아님): kind_conflict
 
 
 @dataclass
@@ -251,20 +256,26 @@ class AssetExtraction:
     rows: list[TransactionCandidate] = field(default_factory=list)
     app_guess: str = ""
     displayed_month: str = ""
-    error_code: str | None = None       # NOT_TRANSACTION_SCREEN / ANALYSIS_OUTPUT_INVALID / REFUSED / API_ERROR ...
+    error_code: str | None = None       # NOT_TRANSACTION_SCREEN / ANALYSIS_OUTPUT_INVALID / OUTPUT_TRUNCATED / REFUSED / RATE_LIMITED / API_ERROR / INTERNAL ...
     error_message: str | None = None
     request_id: str | None = None
     elapsed_sec: float = 0.0
     usage: dict[str, int] = field(default_factory=dict)
 
 
+JobStatus = Literal["succeeded", "partial", "failed", "no_transactions"]
+
+
 @dataclass
 class ExtractionJobResult:
-    """여러 장을 묶은 job 결과. 기능명세서의 queued/running/succeeded/partial/failed 에 대응."""
+    """
+    여러 장을 묶은 job 결과. 기능명세서의 queued/running/succeeded/partial/failed 에 대응.
+    no_transactions: 실패는 없는데 모든 장이 결제 화면이 아니어서(skipped) 거래가 0건. 재시도가 아니라 캡처 교체 안내.
+    """
 
     job_id: str
     slot_month: str
-    status: Literal["succeeded", "partial", "failed"]
+    status: JobStatus
     assets: list[AssetExtraction]
 
     @property
@@ -422,7 +433,8 @@ async def extract_one(
 
         # 출력이 max_tokens 에 잘리면 JSON 이 깨집니다. 행이 비정상적으로 많은 캡처일 때 생깁니다.
         if message.stop_reason == "max_tokens":
-            result.error_code, result.error_message = "ANALYSIS_OUTPUT_INVALID", "output truncated (max_tokens)"
+            # 같은 설정으로 다시 보내도 같은 결과라 재시도 대상이 아닙니다 (사용자에게 캡처 교체 안내)
+            result.error_code, result.error_message = "OUTPUT_TRUNCATED", "output truncated (max_tokens)"
             break
 
         try:
@@ -431,14 +443,14 @@ async def extract_one(
             break  # 성공
         except (ValueError, ValidationError) as e:
             if attempt == 2:
-                result.error_code, result.error_message = "ANALYSIS_OUTPUT_INVALID", str(e)[:500]
+                result.error_code, result.error_message = "ANALYSIS_OUTPUT_INVALID", summarize_validation_error(e)[:500]
                 break
             # 1회 교정: 모델의 응답(사고 블록 포함)을 그대로 돌려주고 무엇이 틀렸는지 알려줍니다.
             # 사고 블록을 수정하거나 빼면 안 됩니다(이 모델은 블록이 대화에 묶여 있습니다).
             log.info("schema repair retry asset=%s request_id=%s", asset_id, result.request_id)
             messages = messages + [
                 {"role": "assistant", "content": message.content},
-                {"role": "user", "content": f"출력이 스키마와 맞지 않습니다: {str(e)[:300]}\n같은 캡처를 다시 읽어 스키마에 맞는 JSON 만 출력하세요."},
+                {"role": "user", "content": f"출력이 스키마와 맞지 않습니다: {summarize_validation_error(e)[:300]}\n같은 캡처를 다시 읽어 스키마에 맞는 JSON 만 출력하세요."},
             ]
 
     result.elapsed_sec = round(time.perf_counter() - started, 2)
@@ -473,29 +485,40 @@ async def extract_one(
 def resolve_date(raw: str, slot_month: str) -> tuple[str, bool]:
     """
     모델이 준 날짜("10-23" 또는 "2026-10-23")를 슬롯 연·월로 확정합니다.
-    반환: (YYYY-MM-DD, 슬롯 월과 다른지 여부)
+    반환: (YYYY-MM-DD 또는 "", 슬롯 월과 다른지 여부)
 
     - 연도가 없으면 슬롯의 연도를 붙입니다. 월이 슬롯과 다르면 그대로 두되 mismatch 를 True 로.
       (예: 10월 슬롯인데 "09-30" 이 보이면 9월 30일로 두고 F04 에서 "9월로 옮길까요?" 제안)
-    - 1월 슬롯에 12월 날짜가 보이는 경우처럼 연도가 넘어가는 케이스는 전년도로 보정합니다.
+    - 연도 경계: 1월 슬롯의 12월 → 전년도, 12월 슬롯의 1월 → 다음 해.
+    - 읽을 수 없는 값("2026-10" 처럼 일이 없음, "02-30", 숫자가 아님, 범위 밖)은 날짜를 지어내지 않고
+      "" 를 돌려줍니다. 호출자가 date_missing 으로 F04 검토 큐에 올립니다.
+      (예전에는 슬롯 1일로 채웠는데, 존재하지 않는 거래가 요일·급여일 탐지에 섞여 들어가서 없앴습니다)
     """
     slot_y, slot_m = (int(x) for x in slot_month.split("-"))
-    parts = [int(p) for p in raw.split("-")]
+    try:
+        parts = [int(p) for p in raw.split("-")]
+    except ValueError:
+        return "", False
     if len(parts) == 3:
         y, m, d = parts
     elif len(parts) == 2:
         m, d = parts
         y = slot_y
-        if m == 12 and slot_m == 1:   # 1월 슬롯에 보이는 12월 → 전년도
+        if m == 12 and slot_m == 1:    # 1월 슬롯에 보이는 12월 → 전년도
             y = slot_y - 1
-    else:                             # "DD": 일만 보이는 화면(일별 보기 헤더) → 슬롯 연·월
+        elif m == 1 and slot_m == 12:  # 12월 슬롯에 보이는 1월 → 다음 해
+            y = slot_y + 1
+    elif len(parts) == 1:              # "DD": 일만 보이는 화면(일별 보기 헤더) → 슬롯 연·월
         (d,) = parts
         y, m = slot_y, slot_m
+    else:
+        return "", False
+    if y < 2000:                       # "26-10-07" 처럼 두 자리 연도는 지어내지 않고 검토로
+        return "", False
     try:
         resolved = date(y, m, d)
-    except ValueError:
-        # 2월 30일 같은 불가능한 날짜 → 슬롯 1일로 두고 플래그. (모델 오독 신호)
-        return f"{slot_y:04d}-{slot_m:02d}-01", True
+    except (ValueError, OverflowError):
+        return "", False
     return resolved.isoformat(), (resolved.year, resolved.month) != (slot_y, slot_m)
 
 
@@ -519,21 +542,82 @@ def normalize_time(raw: str) -> str | None:
     return f"{h:02d}:{mi:02d}"
 
 
-def displayed_month_mismatch(displayed_month: str, slot_month: str) -> bool:
+# 프롬프트가 이미 넣지 말라고 하지만, 모델 순응에만 맡기지 않도록 코드에서 한 번 더 지웁니다.
+# 순서가 중요합니다: 카드(4-4-4-4) → 전화(0xx-xxxx-xxxx) → 계좌(하이픈 묶음, 숫자 9자리 이상) → 긴 숫자열 → 잔액.
+_RE_CARD = re.compile(r"(?<![\d*])(?:[\d*]{4}[ -]){3}[\d*]{4}(?![\d*])")
+_RE_PHONE = re.compile(r"(?<!\d)0\d{1,2}-\d{3,4}-\d{4}(?!\d)")
+_RE_ACCOUNT = re.compile(r"(?<![\d*])(?:[\d*]{1,7}-){1,3}[\d*]{2,}(?![\d*])")   # 그룹 첫 글자가 * 여도 잡음 (마스킹 계좌)
+_RE_LONG_DIGITS = re.compile(r"(?<![\d,])\d{11,}(?![\d,])")                    # 하이픈 없는 계좌·카드. 금액은 쉼표가 있어 안 걸림
+_RE_BALANCE = re.compile(r"잔액\s*[:：]?\s*[-+]?[\d,]+\s*원?")
+
+
+def _account_if_enough_digits(m: "re.Match[str]") -> str:
+    """하이픈 묶음 중 숫자·마스킹 글자가 9개 이상인 것만 계좌로 봅니다. 날짜(2026-10-30), 지점 표기(1-2호점)는 보존."""
+    token = m.group(0)
+    return "[계좌]" if sum(ch.isdigit() or ch == "*" for ch in token) >= 9 else token
+
+
+def scrub_sensitive(text: str) -> str:
     """
-    모델이 적은 표시 월("8월", "2026.10", "10월 내역", "2026-10")에서 숫자만 뽑아 슬롯과 비교합니다.
-    연도가 보이면 연도까지, 아니면 월만 비교합니다. 월을 못 읽으면 비교하지 않습니다(False).
+    merchant / raw_text 에서 카드번호·전화번호·계좌번호·긴 숫자열·잔액 표기를 제거합니다. 거래 식별에 필요 없는 값들입니다.
+    한계(알고 있는 것): 라벨 없이 두 번째 금액으로만 찍힌 잔액("4,500원 1,234,567원")은 금액과 구분할 수 없어 남습니다.
+    이건 프롬프트("잔액은 어떤 필드에도 넣지 않음")에 맡기고, 평가 세트에서 raw_text 의 '원' 개수를 점검합니다.
+    주문번호·ISBN 같은 긴 번호도 함께 지워지는데, 가맹점 식별에는 필요 없는 값이라 감수합니다.
     """
+    if not text:
+        return text
+    text = _RE_CARD.sub("[카드]", text)
+    text = _RE_PHONE.sub("[전화]", text)
+    text = _RE_ACCOUNT.sub(_account_if_enough_digits, text)
+    text = _RE_LONG_DIGITS.sub("[번호]", text)
+    text = _RE_BALANCE.sub("", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+# kind 와 direction 의 정합성. income 은 in, expense 는 out 이어야 합니다.
+# refund / cancel 은 앱마다 표기가 갈립니다(카드사 앱은 "-4,500원 취소" 처럼 음수로, 은행 앱은 "+" 로) → 어느 방향이든 허용.
+# transfer 도 양방향. 모순이면 kind 를 지우지 않고 kind_conflict 플래그만 붙입니다 (지우면 환불이 지출로 집계될 수 있음).
+# F07 집계 규칙: refund / cancel 은 direction 과 무관하게 "지출 차감" 으로 다룹니다.
+_KIND_REQUIRES: dict[str, str] = {"income": "in", "expense": "out"}
+
+
+def reconcile_kind(kind: str, direction: str) -> tuple[str, bool]:
+    """kind 와 direction 이 모순인지 판단. kind 는 보존하고 (kind, 모순 여부) 를 돌려줍니다."""
+    need = _KIND_REQUIRES.get(kind)
+    conflict = bool(need) and direction != "unknown" and direction != need
+    return kind, conflict
+
+
+def summarize_validation_error(e: Exception) -> str:
+    """pydantic 오류를 입력값 없이 요약합니다. 기본 str(e) 에는 input_value 로 가맹점명 원문이 들어갑니다."""
+    if isinstance(e, ValidationError):
+        items = e.errors(include_input=False, include_url=False)[:5]
+        return "; ".join(f"{'.'.join(str(x) for x in it['loc'])}: {it['msg']}" for it in items)
+    return type(e).__name__ + ": invalid JSON"
+
+
+def parse_displayed_month(displayed_month: str) -> tuple[int | None, int | None]:
+    """모델이 적은 표시 월("8월", "2026.10", "10월 내역", "2026년 10월", "2026-10") → (연도 또는 None, 월 또는 None)."""
     if not displayed_month:
-        return False
-    slot_y, slot_m = (int(x) for x in slot_month.split("-"))
+        return None, None
     ym = re.search(r"(20\d{2})\D{0,3}(\d{1,2})", displayed_month)      # 2026.10 / 2026-10 / 2026년 10월
-    if ym:
-        return (int(ym.group(1)), int(ym.group(2))) != (slot_y, slot_m)
+    if ym and 1 <= int(ym.group(2)) <= 12:
+        return int(ym.group(1)), int(ym.group(2))
+    y_only = re.search(r"(20\d{2})", displayed_month)
     m = re.search(r"(\d{1,2})\s*월", displayed_month) or re.fullmatch(r"\s*(\d{1,2})\s*", displayed_month)
-    if m and 1 <= int(m.group(1)) <= 12:
-        return int(m.group(1)) != slot_m
-    return False
+    month = int(m.group(1)) if m and 1 <= int(m.group(1)) <= 12 else None
+    return (int(y_only.group(1)) if y_only else None), month
+
+
+def displayed_month_mismatch(displayed_month: str, slot_month: str) -> bool:
+    """표시 월이 슬롯과 다른지. 연도가 보이면 연도까지, 아니면 월만 비교. 월을 못 읽으면 False."""
+    slot_y, slot_m = (int(x) for x in slot_month.split("-"))
+    y, m = parse_displayed_month(displayed_month)
+    if m is None:
+        return False
+    if y is not None:
+        return (y, m) != (slot_y, slot_m)
+    return m != slot_m
 
 
 def postprocess_row(
@@ -542,32 +626,50 @@ def postprocess_row(
     """모델 출력 한 행 → 검토 표가 쓰는 거래 후보. 숫자·날짜 확정은 전부 여기서."""
     flags: list[str] = []
     raw_date = row.date or header_date          # 행에 날짜가 없으면 헤더 날짜(일별 보기)를 씀
-    if raw_date:
-        resolved_date, mismatch = resolve_date(raw_date, slot_month)
-    else:
-        # 행에도 헤더에도 날짜가 없음 → 지어내지 않고 빈 값으로 둠. F04 검토 큐에서 "필수값 누락"으로
+    resolved_date, mismatch = resolve_date(raw_date, slot_month) if raw_date else ("", False)
+    if not resolved_date:
+        # 행에도 헤더에도 날짜가 없거나 읽을 수 없음 → 지어내지 않고 빈 값. F04 검토 큐에서 "필수값 누락"으로
         # 사용자가 입력해야 확정할 수 있음 (가짜 날짜를 넣으면 실제 거래와 섞여 보여서 더 나쁨)
-        resolved_date, mismatch = "", False
         flags.append("date_missing")
-    if mismatch or displayed_month_mismatch(displayed_month, slot_month):
+    # 헤더 월 불일치를 행에 반영하는 규칙
+    #  - 행 날짜가 없어 헤더에 기댄 행: 헤더 월 불일치를 그대로 반영
+    #  - 행 날짜에 연도가 없고 헤더에 연도가 있는 행: 헤더 연도로 연도 불일치를 잡음
+    #    (작년 10월 캡처를 올해 10월 슬롯에 올리는 경우. 캡처 행에는 연도가 없어 이 길로만 잡힘)
+    #  - 행 날짜가 슬롯 월과 맞는데 헤더 월만 다른 경우(두 달 걸친 캡처): 그 행은 정상
+    header_y, _ = parse_displayed_month(displayed_month)
+    row_has_year = len(row.date.split("-")) == 3 if row.date else False
+    slot_y = int(slot_month.split("-")[0])
+    header_year_mismatch = resolved_date != "" and not row_has_year and header_y is not None and header_y != slot_y
+    if mismatch or header_year_mismatch or (not row.date and displayed_month_mismatch(displayed_month, slot_month)):
         flags.append("month_mismatch")
+    merchant = scrub_sensitive(row.merchant)[:100]
+    if not merchant:
+        flags.append("merchant_missing")        # 필수값 누락 (F04 에서 그대로 두기 불가)
+    kind, conflict = reconcile_kind(row.kind, row.direction)
+    if conflict:
+        flags.append("kind_conflict")           # 정보성. F04 게이트 대상은 아님
     if row.confidence == "low":
         flags.append("low_confidence")
     if row.direction == "unknown":
         flags.append("unknown_direction")       # 합계에서 제외하고 사용자 확인 요청 (F04)
 
+    # id 는 (자산, 행 순서, 슬롯) 으로 결정됩니다. 같은 자산을 재추출하면 같은 id 가 나와서
+    # 재시도 병합 시 중복 행이 생기지 않고, 달 추가 시 구조화 행 재사용에도 안전합니다.
+    source_row_id = f"{asset_id}:row{index:03d}"   # 원문 추적용. 이미지 삭제 후에도 raw_text 로 남음
+    row_id = "tx_" + hashlib.sha1(f"{source_row_id}|{slot_month}".encode()).hexdigest()[:10]
+
     return TransactionCandidate(
-        id=f"tx_{uuid.uuid4().hex[:10]}",
+        id=row_id,
         asset_id=asset_id,
-        source_row_id=f"{asset_id}:row{index:03d}",   # 원문 추적용. 이미지 삭제 후에도 raw_text 로 남음
+        source_row_id=source_row_id,
         date=resolved_date,
         time=normalize_time(row.time),
-        merchant=row.merchant.strip()[:100],
+        merchant=merchant,
         amount_krw=abs(int(row.amount_krw)),
         direction=row.direction,
-        kind=row.kind,
+        kind=kind,
         confidence=row.confidence,
-        raw_text=row.raw_text,
+        raw_text=scrub_sensitive(row.raw_text),
         flags=flags,
     )
 
@@ -600,7 +702,13 @@ async def run_extraction_job(
 
     async def guarded(asset_id: str, path: Path) -> AssetExtraction:
         async with sem:
-            return await extract_one(client, asset_id, path, slot_month)
+            try:
+                return await extract_one(client, asset_id, path, slot_month)
+            except Exception as e:  # noqa: BLE001  예상 못한 예외도 "이 장만 실패" 로 가두어 job 전체를 지킵니다
+                # log.exception 은 트레이스백 끝에 str(e) 를 찍어 원문이 섞일 수 있어 타입명만 남깁니다
+                log.error("unexpected error asset=%s type=%s", asset_id, type(e).__name__)
+                return AssetExtraction(asset_id=asset_id, status="failed",
+                                       error_code="INTERNAL", error_message=type(e).__name__)
 
     try:
         results: list[AssetExtraction] = []
@@ -615,14 +723,7 @@ async def run_extraction_job(
         if own_client:
             await client.close()
 
-    ok = sum(1 for r in results if r.status == "succeeded")
-    failed = sum(1 for r in results if r.status == "failed")
-    if ok == 0:
-        status: Literal["succeeded", "partial", "failed"] = "failed"
-    elif failed > 0:
-        status = "partial"
-    else:
-        status = "succeeded"      # skipped(결제 화면 아님)만 섞인 경우도 succeeded 로 봅니다
+    status = job_status(results)
 
     for r in results:  # 개인정보 없는 운영 로그만 남깁니다 (이미지·원문 제외)
         log.info(
@@ -630,6 +731,49 @@ async def run_extraction_job(
             r.asset_id, r.status, len(r.rows), r.error_code, r.request_id, r.elapsed_sec, r.usage,
         )
     return ExtractionJobResult(job_id=job_id, slot_month=slot_month, status=status, assets=results)
+
+
+def job_status(results: list[AssetExtraction]) -> JobStatus:
+    """자산 상태들 → job 상태. 성공이 하나라도 있고 실패도 있으면 partial, 실패만 있으면 failed,
+    실패 없이 전부 skipped 면 no_transactions (재시도할 것이 없으므로 failed 와 구분)."""
+    ok = sum(1 for r in results if r.status == "succeeded")
+    failed = sum(1 for r in results if r.status == "failed")
+    if not results:
+        return "failed"
+    if ok == 0 and failed == 0:
+        return "no_transactions"
+    if ok == 0:
+        return "failed"
+    if failed > 0:
+        return "partial"
+    return "succeeded"           # skipped 가 섞여 있어도 성공 (그 장만 제외)
+
+
+# 재시도해도 같은 결과가 나오는 실패. 사용자에게 "다른 캡처로 교체" 를 안내합니다.
+NON_RETRYABLE_CODES = frozenset({"UNSUPPORTED_MEDIA", "BAD_REQUEST", "REFUSED", "OUTPUT_TRUNCATED"})
+# 호출자(API 계층)가 지킬 재시도 상한. RATE_LIMITED 가 반복되면 이 횟수 뒤에는 "잠시 후 다시" 안내로 끝냅니다.
+MAX_RETRY_ROUNDS = 2
+
+
+def merge_retry(original: ExtractionJobResult, retry: ExtractionJobResult) -> ExtractionJobResult:
+    """
+    partial 재시도 결과를 원 job 에 병합합니다. 재시도한 자산만 새 결과로 교체하고, 나머지(성공·skipped)는
+    그대로 둡니다. job_id 는 원본을 유지해 클라이언트가 같은 job 을 계속 폴링할 수 있습니다.
+    불변식: 자산 id 집합이 늘지 않고, 성공했던 자산의 행은 바뀌지 않습니다 → 거래 후보 수가 중복으로 늘지 않습니다.
+    """
+    if retry.slot_month != original.slot_month:
+        raise ValueError("retry slot_month differs from original job")   # 행 id 체계가 달라 섞이면 안 됨
+    retried = {a.asset_id: a for a in retry.assets}
+    unknown = set(retried) - {a.asset_id for a in original.assets}
+    if unknown:
+        raise ValueError(f"retry contains assets not in original job: {sorted(unknown)}")
+    protected = {a.asset_id for a in original.assets if a.status == "succeeded" and a.asset_id in retried}
+    if protected:
+        # 성공한 자산은 재시도 대상이 아닙니다. 사용자가 F04 에서 고친 행이 있을 수 있어 덮어쓰지 않습니다.
+        raise ValueError(f"retry would overwrite succeeded assets: {sorted(protected)}")
+    merged = [retried.get(a.asset_id, a) for a in original.assets]
+    return ExtractionJobResult(job_id=original.job_id, slot_month=original.slot_month,
+                               status=job_status(merged), assets=merged)
 
 
 def job_to_payload(job: ExtractionJobResult, file_of: dict[str, str] | None = None) -> dict[str, Any]:
@@ -649,8 +793,13 @@ def job_to_payload(job: ExtractionJobResult, file_of: dict[str, str] | None = No
 
 
 def retryable_assets(job: ExtractionJobResult) -> list[str]:
-    """partial 일 때 다시 보낼 자산만 고릅니다. (성공·skipped 는 재사용, 실패만 재시도)"""
-    return [a.asset_id for a in job.assets if a.status == "failed" and a.error_code not in ("UNSUPPORTED_MEDIA", "BAD_REQUEST")]
+    """partial/failed 일 때 다시 보낼 자산만 고릅니다. (성공·skipped 는 재사용, 일시 오류만 재시도)"""
+    return [a.asset_id for a in job.assets if a.status == "failed" and a.error_code not in NON_RETRYABLE_CODES]
+
+
+def replace_needed_assets(job: ExtractionJobResult) -> list[str]:
+    """재시도로는 해결되지 않아 사용자가 다른 캡처로 바꿔야 하는 자산."""
+    return [a.asset_id for a in job.assets if a.status == "failed" and a.error_code in NON_RETRYABLE_CODES]
 
 
 # ---------------------------------------------------------------------------
