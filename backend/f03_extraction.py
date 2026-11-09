@@ -33,6 +33,7 @@ load_dotenv()  # backend/.env 가 있으면 환경변수로 올림. 없으면 �
 import argparse
 import asyncio
 import base64
+import re
 import io
 import os
 import json
@@ -63,8 +64,8 @@ log = logging.getLogger("f03")
 # ---------------------------------------------------------------------------
 
 MODEL = os.environ.get("F03_MODEL", "claude-sonnet-5-5")  # .env 의 F03_MODEL 로 교체 가능. 평가 세트로 claude-opus-5-5 와 비교 예정
-EXTRACTOR_VERSION = "f03-0.1"           # 코드 변경 시 올림. 결과에 기록해 재추출 비교에 사용
-PROMPT_VERSION = "p1"                   # SYSTEM_PROMPT 수정 시 올림 (p1, p2, ...)
+EXTRACTOR_VERSION = "f03-0.5"           # 코드 변경 시 올림. 결과에 기록해 재추출 비교에 사용
+PROMPT_VERSION = "p3"                   # SYSTEM_PROMPT 수정 시 올림 (p1, p2, ...)
 EFFORT = "low"                       # 추출은 깊은 추론이 필요 없어서 low. 품질이 부족하면 medium
 MAX_TOKENS = 8000                    # 캡처 1장 = 보통 15행 안팎. 사고 토큰도 여기 포함되므로 여유 있게
 MAX_LONG_EDGE_PX = 1568              # API가 어차피 이 크기로 축소하므로 미리 줄여서 전송량을 아낌
@@ -91,14 +92,20 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
         "is_transaction_screen": {"type": "boolean"},
         # 어느 앱 캡처로 보이는지 (토스, 카카오뱅크, 삼성카드 ...). 모르면 "".
         "app_guess": {"type": "string"},
-        # 캡처에 표시된 월. "YYYY-MM" 또는 "". 슬롯 월과 다르면 후처리에서 플래그를 세웁니다.
+        # 캡처에 표시된 월 표기 그대로 ("8월", "2026.10" 등). 후처리에서 숫자만 뽑아 슬롯 월과 비교합니다.
         "displayed_month": {"type": "string"},
+        # 행마다 날짜가 없는 화면(달력에서 하루를 고른 일별 보기 등)에서 헤더에 보이는 날짜.
+        # 모든 행에 공통 적용됩니다. "DD", "MM-DD", "YYYY-MM-DD" 중 보이는 만큼. 없으면 "".
+        "header_date": {
+            "type": "string",
+            "description": "행마다 날짜가 없을 때 화면 헤더·달력에서 선택된 날짜. DD 또는 MM-DD 또는 YYYY-MM-DD. 없으면 빈 문자열",
+        },
         "rows": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
-                    "date": {"type": "string", "description": "MM-DD. 캡처에 연도가 있으면 YYYY-MM-DD"},
+                    "date": {"type": "string", "description": "MM-DD. 캡처에 연도가 있으면 YYYY-MM-DD. 그 행에 날짜가 보이지 않으면 빈 문자열"},
                     "time": {"type": "string", "description": "HH:MM. 없으면 빈 문자열"},
                     "merchant": {"type": "string", "description": "가맹점·상대방 표기 원문. 100자 이내"},
                     "amount_krw": {"type": "integer", "description": "양수 정수 원. 부호는 direction 으로"},
@@ -115,9 +122,19 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
             },
         },
     },
-    "required": ["is_transaction_screen", "app_guess", "displayed_month", "rows"],
+    "required": ["is_transaction_screen", "app_guess", "displayed_month", "header_date", "rows"],
     "additionalProperties": False,
 }
+
+
+def _check_date_shape(v: str) -> str:
+    """허용: "" / "DD" / "MM-DD" / "YYYY-MM-DD". 그 외("10월 23일" 등)는 스키마 오류로 보고 교정 재시도를 유도합니다."""
+    if v == "":
+        return v
+    parts = v.split("-")
+    if len(parts) not in (1, 2, 3) or not all(p.isdigit() for p in parts):
+        raise ValueError(f"date must be '', DD, MM-DD or YYYY-MM-DD, got {v!r}")
+    return v
 
 
 class ExtractedRow(BaseModel):
@@ -135,18 +152,20 @@ class ExtractedRow(BaseModel):
     @field_validator("date")
     @classmethod
     def _date_shape(cls, v: str) -> str:
-        # "MM-DD" 또는 "YYYY-MM-DD" 만 허용. 그 외는 스키마 오류로 간주해 교정 재시도를 유도합니다.
-        parts = v.split("-")
-        if len(parts) not in (2, 3) or not all(p.isdigit() for p in parts):
-            raise ValueError(f"date must be MM-DD or YYYY-MM-DD, got {v!r}")
-        return v
+        return _check_date_shape(v)
 
 
 class ExtractionOutput(BaseModel):
     is_transaction_screen: bool
     app_guess: str
     displayed_month: str
+    header_date: str = ""          # 행에 날짜가 없는 화면의 공통 날짜 (없으면 "")
     rows: list[ExtractedRow]
+
+    @field_validator("header_date")
+    @classmethod
+    def _header_date_shape(cls, v: str) -> str:
+        return _check_date_shape(v)
 
 
 # ---------------------------------------------------------------------------
@@ -169,15 +188,24 @@ SYSTEM_PROMPT = """당신은 한국 금융 앱(토스, 카카오뱅크, 카카�
   "환불"/"취소" 표기가 있으면 각각 "refund"/"cancel", 모르면 "unknown".
 - 날짜에 연도가 없으면 MM-DD 로만 적습니다. 연도를 지어내지 마세요. 사용자 메시지에 이 캡처가
   속한 연·월 힌트가 있으니 displayed_month 는 화면에 실제로 보이는 월 표기를 기준으로 적습니다.
+- 행마다 날짜가 없는 화면이 있습니다(달력에서 하루를 골라 그날 내역만 보여주는 일별 보기, "21일 금요일" 같은 헤더).
+  이때는 각 행의 date 를 "" 로 두고, 헤더·달력에서 선택된 날짜를 header_date 에 적습니다
+  (일만 보이면 "DD", 월·일이 보이면 "MM-DD"). 행에 날짜가 있는 보통 목록 화면에서는 header_date 를 "" 로 둡니다.
+  행에도 헤더에도 날짜가 없으면 둘 다 "" 로 두고 추측하지 않습니다.
 - 시각이 없는 행은 time 을 "" 로 둡니다.
 - merchant 는 화면 표기 그대로(법인명, 지점명 포함) 적습니다. 카테고리로 바꾸지 마세요.
 - raw_text 에는 그 행에 보이는 글자를 순서대로 그대로 옮깁니다.
-- 이름, 계좌번호, 카드번호는 어떤 필드에도 넣지 않습니다.
+- 계좌번호, 카드번호, 잔액은 어떤 필드에도 넣지 않습니다.
+- 사람 이름(송금·입금 상대방, 통장 주인)은 개인정보라 추출하지 않습니다. 상대방이 사람 이름이면
+  merchant 를 "개인" 으로 적고 kind 는 "transfer" 로 둡니다. raw_text 에서도 이름 자리를 "개인" 으로 바꿉니다.
+  상호·법인·서비스명(카카오페이, 네이버파이낸셜, OO식당)은 이름이 아니므로 그대로 적습니다.
 
 자주 틀리는 지점 (특히 주의)
 - 숫자 0 과 8, 1 과 7 을 혼동하기 쉽습니다. 쉼표 위치로 자릿수를 다시 확인하세요.
 - 한 행이 두 줄로 표시되는 앱이 있습니다(가맹점명 줄 + 금액/시각 줄). 두 줄을 한 행으로 합칩니다.
 - 화면 맨 위나 아래에 잘린 행은 금액이 온전히 보일 때만 포함하고 confidence 를 "low" 로 둡니다.
+  금액이 안 보이는 행(시각이나 잔액만 남은 조각)은 아예 포함하지 않습니다. amount_krw 0 은 쓰지 않습니다.
+- 목록이 최신순이고 맨 위 행들 위에 날짜 헤더가 잘려 안 보이면 그 행들의 date 는 "" 로 둡니다. 아래 헤더 날짜를 빌려 쓰지 않습니다.
 
 결제 내역 화면이 아니면(홈 화면, 광고, 다른 앱) is_transaction_screen 을 false 로 두고 rows 는 빈 배열로 둡니다."""
 
@@ -203,7 +231,7 @@ class TransactionCandidate:
     id: str
     asset_id: str
     source_row_id: str
-    date: str                      # YYYY-MM-DD (슬롯 연·월로 확정됨)
+    date: str                      # YYYY-MM-DD (슬롯 연·월로 확정됨). 날짜를 못 읽은 행은 "" + flags "date_missing"
     time: str | None               # HH:MM 또는 None
     merchant: str
     amount_krw: int
@@ -211,7 +239,7 @@ class TransactionCandidate:
     kind: str
     confidence: str                # high / medium / low (모델 참고값. 화면에 정확도로 표시하지 않음)
     raw_text: str
-    flags: list[str] = field(default_factory=list)   # "month_mismatch", "low_confidence", "unknown_direction"
+    flags: list[str] = field(default_factory=list)   # "month_mismatch", "low_confidence", "unknown_direction", "date_missing"
 
 
 @dataclass
@@ -426,7 +454,14 @@ async def extract_one(
 
     result.status = "succeeded"
     result.app_guess, result.displayed_month = parsed.app_guess, parsed.displayed_month
-    result.rows = [postprocess_row(r, i, asset_id, slot_month, parsed.displayed_month) for i, r in enumerate(parsed.rows)]
+    # 금액이 0 인 행은 잘린 조각(시각·잔액만 보이는 행)이라 거래로 볼 수 없어 버립니다.
+    dropped = sum(1 for r in parsed.rows if r.amount_krw == 0)
+    if dropped:
+        log.info("drop zero-amount rows asset=%s n=%d", asset_id, dropped)
+    result.rows = [
+        postprocess_row(r, i, asset_id, slot_month, parsed.displayed_month, parsed.header_date)
+        for i, r in enumerate(parsed.rows) if r.amount_krw != 0
+    ]
     return result
 
 
@@ -448,11 +483,14 @@ def resolve_date(raw: str, slot_month: str) -> tuple[str, bool]:
     parts = [int(p) for p in raw.split("-")]
     if len(parts) == 3:
         y, m, d = parts
-    else:
+    elif len(parts) == 2:
         m, d = parts
         y = slot_y
         if m == 12 and slot_m == 1:   # 1월 슬롯에 보이는 12월 → 전년도
             y = slot_y - 1
+    else:                             # "DD": 일만 보이는 화면(일별 보기 헤더) → 슬롯 연·월
+        (d,) = parts
+        y, m = slot_y, slot_m
     try:
         resolved = date(y, m, d)
     except ValueError:
@@ -461,13 +499,57 @@ def resolve_date(raw: str, slot_month: str) -> tuple[str, bool]:
     return resolved.isoformat(), (resolved.year, resolved.month) != (slot_y, slot_m)
 
 
+def normalize_time(raw: str) -> str | None:
+    """
+    모델이 적은 시각을 HH:MM 으로 통일합니다. "9:07", "09:07:55", "오후 2:15" 같은 변형을 흡수하고,
+    시각으로 읽을 수 없으면 None. (모델마다 초 단위를 붙이거나 빼는 편차가 있어 코드에서 고정)
+    """
+    if not raw:
+        return None
+    m = re.search(r"(\d{1,2}):(\d{2})", raw)
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    if "오후" in raw and h < 12:
+        h += 12
+    if "오전" in raw and h == 12:
+        h = 0
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        return None
+    return f"{h:02d}:{mi:02d}"
+
+
+def displayed_month_mismatch(displayed_month: str, slot_month: str) -> bool:
+    """
+    모델이 적은 표시 월("8월", "2026.10", "10월 내역", "2026-10")에서 숫자만 뽑아 슬롯과 비교합니다.
+    연도가 보이면 연도까지, 아니면 월만 비교합니다. 월을 못 읽으면 비교하지 않습니다(False).
+    """
+    if not displayed_month:
+        return False
+    slot_y, slot_m = (int(x) for x in slot_month.split("-"))
+    ym = re.search(r"(20\d{2})\D{0,3}(\d{1,2})", displayed_month)      # 2026.10 / 2026-10 / 2026년 10월
+    if ym:
+        return (int(ym.group(1)), int(ym.group(2))) != (slot_y, slot_m)
+    m = re.search(r"(\d{1,2})\s*월", displayed_month) or re.fullmatch(r"\s*(\d{1,2})\s*", displayed_month)
+    if m and 1 <= int(m.group(1)) <= 12:
+        return int(m.group(1)) != slot_m
+    return False
+
+
 def postprocess_row(
-    row: ExtractedRow, index: int, asset_id: str, slot_month: str, displayed_month: str
+    row: ExtractedRow, index: int, asset_id: str, slot_month: str, displayed_month: str, header_date: str = ""
 ) -> TransactionCandidate:
     """모델 출력 한 행 → 검토 표가 쓰는 거래 후보. 숫자·날짜 확정은 전부 여기서."""
-    resolved_date, mismatch = resolve_date(row.date, slot_month)
     flags: list[str] = []
-    if mismatch or (displayed_month and displayed_month != slot_month):
+    raw_date = row.date or header_date          # 행에 날짜가 없으면 헤더 날짜(일별 보기)를 씀
+    if raw_date:
+        resolved_date, mismatch = resolve_date(raw_date, slot_month)
+    else:
+        # 행에도 헤더에도 날짜가 없음 → 지어내지 않고 빈 값으로 둠. F04 검토 큐에서 "필수값 누락"으로
+        # 사용자가 입력해야 확정할 수 있음 (가짜 날짜를 넣으면 실제 거래와 섞여 보여서 더 나쁨)
+        resolved_date, mismatch = "", False
+        flags.append("date_missing")
+    if mismatch or displayed_month_mismatch(displayed_month, slot_month):
         flags.append("month_mismatch")
     if row.confidence == "low":
         flags.append("low_confidence")
@@ -479,7 +561,7 @@ def postprocess_row(
         asset_id=asset_id,
         source_row_id=f"{asset_id}:row{index:03d}",   # 원문 추적용. 이미지 삭제 후에도 raw_text 로 남음
         date=resolved_date,
-        time=row.time or None,
+        time=normalize_time(row.time),
         merchant=row.merchant.strip()[:100],
         amount_krw=abs(int(row.amount_krw)),
         direction=row.direction,
@@ -550,6 +632,22 @@ async def run_extraction_job(
     return ExtractionJobResult(job_id=job_id, slot_month=slot_month, status=status, assets=results)
 
 
+def job_to_payload(job: ExtractionJobResult, file_of: dict[str, str] | None = None) -> dict[str, Any]:
+    """job 결과 → 저장·API 응답용 dict. 모델·버전을 함께 기록해 나중에 재추출 결과와 비교할 수 있게 합니다."""
+    file_of = file_of or {}
+    return {
+        "job_id": job.job_id, "slot_month": job.slot_month, "status": job.status,
+        "model": MODEL, "extractor_version": EXTRACTOR_VERSION, "prompt_version": PROMPT_VERSION,
+        "effort": EFFORT,
+        "assets": [
+            {**{k: v for k, v in a.__dict__.items() if k != "rows"},
+             "file": file_of.get(a.asset_id, ""),            # 평가 스크립트가 정답 파일과 짝짓는 키
+             "rows": [r.__dict__ for r in a.rows]}
+            for a in job.assets
+        ],
+    }
+
+
 def retryable_assets(job: ExtractionJobResult) -> list[str]:
     """partial 일 때 다시 보낼 자산만 고릅니다. (성공·skipped 는 재사용, 실패만 재시도)"""
     return [a.asset_id for a in job.assets if a.status == "failed" and a.error_code not in ("UNSUPPORTED_MEDIA", "BAD_REQUEST")]
@@ -588,18 +686,7 @@ def _main() -> None:
         print(f"    ... {len(job.all_rows) - 10} more")
 
     # 전체 결과 저장 (검토 표 UI 개발·평가 스크립트 입력으로 사용)
-    file_of = {aid: p.name for aid, p in assets}   # 평가 스크립트가 정답 파일과 짝짓는 키
-    payload = {
-        "job_id": job.job_id, "slot_month": job.slot_month, "status": job.status,
-        "model": MODEL, "extractor_version": EXTRACTOR_VERSION, "prompt_version": PROMPT_VERSION,
-        "effort": EFFORT,
-        "assets": [
-            {**{k: v for k, v in a.__dict__.items() if k != "rows"},
-             "file": file_of.get(a.asset_id, ""),
-             "rows": [r.__dict__ for r in a.rows]}
-            for a in job.assets
-        ],
-    }
+    payload = job_to_payload(job, {aid: p.name for aid, p in assets})
     Path(args.out).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\nsaved → {args.out}")
 

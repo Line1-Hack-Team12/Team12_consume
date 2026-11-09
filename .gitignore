@@ -13,3 +13,9 @@ backend/samples/
 backend/truth/
 backend/*_result*.json
 backend/report_*.json
+
+# 내부 문서 (깃허브 미공개)
+function.md
+prototype.html
+PRD_*.md
+*.docx

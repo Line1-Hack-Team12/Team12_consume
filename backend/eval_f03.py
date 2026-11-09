@@ -12,8 +12,12 @@ F03 구조화 추출 채점기
   - 소요 시간    : 자산별 elapsed_sec
 
 사용 순서
-  1) 샘플 캡처를 ./samples/ 에 넣고 추출 실행
+  1) 샘플 캡처를 ./samples/ 에 넣고 추출 실행.
+     모든 캡처가 같은 달이면 f03_extraction.py 를 그대로 쓰고,
        $ python f03_extraction.py ./samples --slot 2026-10 --out samples_result.json
+     캡처마다 달이 다르면 samples/slots.json 에 {"파일명": "YYYY-MM"} 을 적고 run 을 씁니다
+     (슬롯별로 job 을 나눠 돌린 뒤 한 결과 파일로 합칩니다. 실제 서비스도 슬롯 단위 job 입니다).
+       $ python eval_f03.py run --samples ./samples --slots ./samples/slots.json --out samples_result.json
   2) 추출 결과로 정답 템플릿 생성 (예측값이 미리 채워져 있으니 틀린 곳만 고치면 됨)
        $ python eval_f03.py template --result samples_result.json --truth ./truth
   3) truth/<파일명>.json 을 열어 금액·날짜·가맹점·방향을 캡처와 대조해 고침
@@ -71,6 +75,7 @@ class Row:
     merchant: str
     amount_krw: int
     direction: str
+    flags: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Row":
@@ -80,7 +85,21 @@ class Row:
             merchant=str(d.get("merchant") or ""),
             amount_krw=int(d.get("amount_krw") or 0),
             direction=str(d.get("direction") or "unknown"),
+            flags=list(d.get("flags") or []),
         )
+
+    @property
+    def date_unknown(self) -> bool:
+        """날짜를 알 수 없는 행. 추출기가 date_missing 으로 넘겼거나(예측), 캡처에 날짜가 없어 정답도 빈 값(정답)."""
+        return self.date == "" or "date_missing" in self.flags
+
+
+def _same_date(t: "Row", p: "Row") -> bool:
+    """정답이 '모름'이면 예측도 '모름'이어야 맞고, 정답이 있으면 예측이 같아야 합니다.
+    (정답은 모르는데 예측이 날짜를 적었다면 지어낸 것이므로 다른 날짜로 취급)"""
+    if t.date_unknown:
+        return p.date_unknown
+    return t.date == p.date
 
 
 @dataclass
@@ -93,6 +112,7 @@ class AssetScore:
     matched: int = 0            # 같은 거래로 짝지어진 수 (금액 일치 + 금액 오독 포함)
     amount_wrong: int = 0       # 짝은 맞았는데 금액이 다른 수
     date_wrong: int = 0
+    date_review: int = 0        # 날짜를 못 읽어 검토로 넘긴 수 (오류 아님, 참고용)
     time_wrong: int = 0
     direction_wrong: int = 0
     missing: int = 0            # 정답에만 있음
@@ -142,7 +162,7 @@ def _pair_rows(truth: list[Row], pred: list[Row]) -> list[tuple[int | None, int 
         for pi, p in enumerate(pred):
             if pi in used_p:
                 continue
-            if t.date == p.date and t.amount_krw == p.amount_krw and t.direction == p.direction:
+            if _same_date(t, p) and t.amount_krw == p.amount_krw and t.direction == p.direction:
                 sim = merchant_similarity(t.merchant, p.merchant)
                 if sim > best_sim:
                     best, best_sim = pi, sim
@@ -159,7 +179,7 @@ def _pair_rows(truth: list[Row], pred: list[Row]) -> list[tuple[int | None, int 
         for pi, p in enumerate(pred):
             if pi in used_p:
                 continue
-            if t.date != p.date:
+            if not _same_date(t, p):
                 continue
             sim = merchant_similarity(t.merchant, p.merchant)
             if sim >= best_sim:
@@ -224,7 +244,9 @@ def score_asset(asset: dict[str, Any], truth: dict[str, Any] | None) -> AssetSco
         if t.amount_krw != p.amount_krw:
             sc.amount_wrong += 1
             sc.details.append(f"금액  : 정답 {t.amount_krw:,} / 추출 {p.amount_krw:,}  ({t.merchant})")
-        if t.date != p.date:
+        if t.date_unknown and p.date_unknown:
+            sc.date_review += 1          # 둘 다 "모름": 정상 (검토 큐로 넘어감)
+        elif t.date != p.date:
             sc.date_wrong += 1
             sc.details.append(f"날짜  : 정답 {t.date} / 추출 {p.date}  ({t.merchant})")
         if (t.time or "") != (p.time or ""):
@@ -260,7 +282,7 @@ def build_report(result: dict[str, Any], truth_dir: Path) -> dict[str, Any]:
     tot = Counter()
     sim_sum = 0.0
     for s in scores:
-        for k in ("truth_n", "pred_n", "matched", "amount_wrong", "date_wrong", "time_wrong",
+        for k in ("truth_n", "pred_n", "matched", "amount_wrong", "date_wrong", "date_review", "time_wrong",
                   "direction_wrong", "missing", "extra"):
             tot[k] += getattr(s, k)
         sim_sum += s.merchant_sim_sum
@@ -281,6 +303,7 @@ def build_report(result: dict[str, Any], truth_dir: Path) -> dict[str, Any]:
         "missing": tot["missing"],
         "extra": tot["extra"],
         "date_match_rate": None if tot["matched"] == 0 else 1 - tot["date_wrong"] / tot["matched"],
+        "date_review": tot["date_review"],
         "time_match_rate": None if tot["matched"] == 0 else 1 - tot["time_wrong"] / tot["matched"],
         "direction_match_rate": None if tot["matched"] == 0 else 1 - tot["direction_wrong"] / tot["matched"],
         "merchant_similarity_avg": None if tot["matched"] == 0 else sim_sum / tot["matched"],
@@ -302,7 +325,7 @@ def print_report(rep: dict[str, Any]) -> None:
     print(f"{'파일':28} {'상태':9} {'정답':>4} {'추출':>4} {'짝':>4} {'금액X':>5} {'누락':>4} {'과잉':>4} {'초':>6}")
     for a in rep["assets"]:
         mark = "" if a["status_ok"] else " !"
-        print(f"{a['file'][:28]:28} {a['status']:9} {a['truth_n']:>4} {a['pred_n']:>4} {a['matched']:>4} "
+        print(f"{a['file'][-28:]:28} {a['status']:9} {a['truth_n']:>4} {a['pred_n']:>4} {a['matched']:>4} "
               f"{a['amount_wrong']:>5} {a['missing']:>4} {a['extra']:>4} {a['elapsed_sec']:>6.1f}{mark}")
     print("-" * 78)
     p = s["pass"]
@@ -311,7 +334,7 @@ def print_report(rep: dict[str, Any]) -> None:
     print(f"누락             {s['missing']:>7}  (목표 0)      {ok(p['missing'])}")
     print(f"과잉             {s['extra']:>7}")
     print(f"상태 일치        {s['status_ok']:>4}/{s['assets']:<3}              {ok(p['status'])}")
-    print(f"날짜 일치율      {_pct(s['date_match_rate']):>7}")
+    print(f"날짜 일치율      {_pct(s['date_match_rate']):>7}  (날짜 검토 넘김 {s['date_review']}건은 제외)")
     print(f"시각 일치율      {_pct(s['time_match_rate']):>7}")
     print(f"방향 일치율      {_pct(s['direction_match_rate']):>7}")
     print(f"가맹점 유사도    {_pct(s['merchant_similarity_avg']):>7}")
@@ -346,7 +369,10 @@ def cmd_template(args: argparse.Namespace) -> None:
             "expect_skipped": asset.get("status") == "skipped",
             "_note": "예측값이 채워져 있습니다. 캡처와 대조해 틀린 곳을 고치고, 빠진 행은 추가, 없는 행은 삭제하세요.",
             "rows": [
-                {"date": r.get("date", ""), "time": r.get("time") or "", "merchant": r.get("merchant", ""),
+                # 추출기가 날짜를 못 읽은 행은 정답 템플릿에도 "" 로 둡니다. 캡처에 날짜가 정말 없으면 그대로 두고,
+                # 사람이 캡처에서 날짜를 읽을 수 있으면 채워 넣으세요 (그러면 추출기가 놓친 것으로 채점됩니다).
+                {"date": "" if "date_missing" in (r.get("flags") or []) else r.get("date", ""),
+                 "time": r.get("time") or "", "merchant": r.get("merchant", ""),
                  "amount_krw": r.get("amount_krw", 0), "direction": r.get("direction", "out")}
                 for r in asset.get("rows", [])
             ],
@@ -355,6 +381,47 @@ def cmd_template(args: argparse.Namespace) -> None:
         made += 1
         print(f"wrote {tpath}  ({len(truth['rows'])} rows)")
     print(f"\n{made}개 템플릿 생성. 파일을 열어 캡처와 대조해 고친 뒤 score 를 실행하세요.")
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    """slots.json 기준으로 슬롯별 job 을 돌리고 결과를 한 파일로 합칩니다 (평가 전용 편의 기능)."""
+    import asyncio
+    import f03_extraction as f03
+
+    samples = Path(args.samples)
+    slots: dict[str, str] = json.loads(Path(args.slots).read_text(encoding="utf-8"))
+    by_slot: dict[str, list[tuple[str, Path]]] = {}
+    for name, slot in slots.items():
+        path = samples / name
+        if not path.exists():
+            print(f"경고: {path} 없음, 건너뜀")
+            continue
+        by_slot.setdefault(slot, []).append((Path(name).stem, path))   # asset_id = 파일명 stem
+    if not by_slot:
+        raise SystemExit("slots.json 에 유효한 항목이 없습니다")
+
+    async def run_all():
+        jobs = []
+        for slot, assets in sorted(by_slot.items()):
+            print(f"slot {slot}: {len(assets)}장")
+            jobs.append(await f03.run_extraction_job(assets, slot))
+        return jobs
+
+    jobs = asyncio.run(run_all())
+    merged: dict[str, Any] | None = None
+    for job, (slot, assets) in zip(jobs, sorted(by_slot.items())):
+        payload = f03.job_to_payload(job, {aid: p.name for aid, p in assets})
+        for a in payload["assets"]:
+            a["slot_month"] = slot
+        if merged is None:
+            merged = {**payload, "slot_month": "mixed", "job_id": "eval", "status": "mixed", "assets": []}
+        merged["assets"].extend(payload["assets"])
+
+    for a in merged["assets"]:
+        print(f"  {a['file'][:36]:36} {a['slot_month']} {a['status']:9} rows={len(a['rows']):3} "
+              f"app={a.get('app_guess') or '-'} month={a.get('displayed_month') or '-'} {a['elapsed_sec']}s")
+    Path(args.out).write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"saved → {args.out}")
 
 
 def cmd_score(args: argparse.Namespace) -> None:
@@ -388,6 +455,12 @@ def cmd_compare(args: argparse.Namespace) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="F03 추출 채점기")
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    r = sub.add_parser("run", help="slots.json 기준으로 슬롯별 추출 후 결과 병합")
+    r.add_argument("--samples", default="./samples")
+    r.add_argument("--slots", default="./samples/slots.json")
+    r.add_argument("--out", default="samples_result.json")
+    r.set_defaults(fn=cmd_run)
 
     t = sub.add_parser("template", help="추출 결과에서 정답 템플릿 생성")
     t.add_argument("--result", required=True)
