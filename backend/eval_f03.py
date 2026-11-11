@@ -76,6 +76,7 @@ class Row:
     amount_krw: int
     direction: str
     flags: list[str] = field(default_factory=list)
+    kind: str = ""
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Row":
@@ -86,7 +87,14 @@ class Row:
             amount_krw=int(d.get("amount_krw") or 0),
             direction=str(d.get("direction") or "unknown"),
             flags=list(d.get("flags") or []),
+            kind=str(d.get("kind") or ""),
         )
+
+    @property
+    def direction_irrelevant(self) -> bool:
+        # 본인 계좌 간 이동은 F07 에서 방향과 무관하게 집계 제외라 방향 오독을 세지 않는다.
+        # 부호 없이 "A → B" 만 있는 행은 모델이 in/out/unknown 을 오가므로 지표에서 빼야 노이즈가 줄어든다.
+        return self.kind == "self_transfer"
 
     @property
     def date_unknown(self) -> bool:
@@ -162,7 +170,7 @@ def _pair_rows(truth: list[Row], pred: list[Row]) -> list[tuple[int | None, int 
         for pi, p in enumerate(pred):
             if pi in used_p:
                 continue
-            if _same_date(t, p) and t.amount_krw == p.amount_krw and t.direction == p.direction:
+            if _same_date(t, p) and t.amount_krw == p.amount_krw and (t.direction == p.direction or t.direction_irrelevant):
                 sim = merchant_similarity(t.merchant, p.merchant)
                 if sim > best_sim:
                     best, best_sim = pi, sim
@@ -252,7 +260,7 @@ def score_asset(asset: dict[str, Any], truth: dict[str, Any] | None) -> AssetSco
         if (t.time or "") != (p.time or ""):
             sc.time_wrong += 1
             sc.details.append(f"시각  : 정답 {t.time or '-'} / 추출 {p.time or '-'}  ({t.merchant})")
-        if t.direction != p.direction:
+        if t.direction != p.direction and not t.direction_irrelevant:
             sc.direction_wrong += 1
             sc.details.append(f"방향  : 정답 {t.direction} / 추출 {p.direction}  ({t.merchant})")
     return sc

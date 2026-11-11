@@ -270,7 +270,7 @@ def test_merge_retry_keeps_row_count_invariant():
 
 
 def test_unexpected_exception_in_one_asset_does_not_kill_job(monkeypatch, tmp_path):
-    async def fake_extract_one(client, asset_id, path, slot_month):
+    async def fake_extract_one(client, asset_id, path, slot_month, owner_name=None):
         if asset_id == "bad":
             raise RuntimeError("boom")
         return _asset(asset_id, "succeeded", nrows=2)
@@ -326,3 +326,110 @@ def test_merge_retry_rejects_slot_change_and_overwriting_success():
     # 실패 자산이 재시도에서도 실패하면 partial 유지 + 여전히 재시도 대상
     merged = merge_retry(original, ExtractionJobResult("j", "2026-10", "failed", [_asset("b", "failed", "NETWORK_ERROR")]))
     assert merged.status == "partial" and retryable_assets(merged) == ["b"]
+
+
+
+# ---- v0.8: 일별 보기 + 잘못된 슬롯 ----
+
+def test_day_only_date_uses_displayed_month_not_slot():
+    # 화면 "10월" + 헤더 "5일" 을 11월 슬롯에 올림: 날짜는 화면대로 10-05, 불일치 플래그
+    tx = postprocess_row(_row(date=""), 0, "a", "2026-11", "10월", header_date="05")
+    assert tx.date == "2026-10-05" and "month_mismatch" in tx.flags
+    # 슬롯이 맞으면 플래그 없음
+    tx = postprocess_row(_row(date=""), 0, "a", "2026-10", "10월", header_date="05")
+    assert tx.date == "2026-10-05" and "month_mismatch" not in tx.flags
+    # 화면에 연도까지 있으면 연도도 화면 기준 (작년 캡처 → 불일치)
+    tx = postprocess_row(_row(date=""), 0, "a", "2026-10", "2025.10", header_date="05")
+    assert tx.date == "2025-10-05" and "month_mismatch" in tx.flags
+    # 화면에 달이 없으면 종전대로 슬롯 달
+    tx = postprocess_row(_row(date=""), 0, "a", "2026-11", "", header_date="05")
+    assert tx.date == "2026-11-05" and "month_mismatch" not in tx.flags
+    # 행 날짜에 이미 달이 있으면 손대지 않음
+    tx = postprocess_row(_row(date="10-07"), 0, "a", "2026-11", "11월")
+    assert tx.date == "2026-10-07" and "month_mismatch" in tx.flags
+
+
+def test_scrub_person_name_with_account_note():
+    assert scrub_sensitive("내 토스뱅크 통장 → 이아림(모임통장)") == "내 토스뱅크 통장 → 개인"
+    assert scrub_sensitive("김철수 (생활비)") == "개인"
+    assert scrub_sensitive("카카오페이(모임통장)") == "카카오페이(모임통장)"     # 5자 이상 상호는 그대로
+    assert scrub_sensitive("CU 운정애플점") == "CU 운정애플점"
+
+
+# ---- v0.9: 조각 행 제거, raw_text 의 잔액 제거 ----
+
+from f03_extraction import is_fragment, strip_other_amounts
+
+
+def test_fragment_row_without_merchant_and_direction():
+    tx = postprocess_row(_row(merchant="", direction="unknown", kind="unknown", date="", raw_text="21:15 -2,095,864원"),
+                         0, "a", "2026-11", "")
+    assert is_fragment(tx)
+    assert not is_fragment(postprocess_row(_row(merchant="", direction="out", date="10-01"), 0, "a", "2026-10", ""))
+    assert not is_fragment(postprocess_row(_row(direction="unknown", date="10-01"), 0, "a", "2026-10", ""))
+
+
+def test_strip_other_amounts_keeps_only_transaction_amount():
+    assert strip_other_amounts("개인 5,750원 14:15 -1,934,364원", 5750) == "개인 5,750원 14:15"
+    assert strip_other_amounts("네이버페이충전 -100,000원 19:36 #자동이체 -2,134,364원", 100000) == "네이버페이충전 -100,000원 19:36 #자동이체"
+    assert strip_other_amounts("-29,000 -26,331원 내 포인트 사용 | Apple Services", 26331) == "-29,000 -26,331원 내 포인트 사용 | Apple Services"
+    assert strip_other_amounts("43원 카드 캐시백 → 내 토스뱅크 통장", 43) == "43원 카드 캐시백 → 내 토스뱅크 통장"
+    assert strip_other_amounts("-14,500원 레벨업pc방 | 토스뱅크 체크카드 캐시백 43", 14500) == "-14,500원 레벨업pc방 | 토스뱅크 체크카드 캐시백 43"
+    tx = postprocess_row(_row(amount_krw=5750, raw_text="개인 5,750원 14:15 -1,934,364원", date="11-02"), 0, "a", "2026-11", "")
+    assert "1,934,364" not in tx.raw_text and "5,750원" in tx.raw_text
+
+
+from f03_extraction import effective_header_date
+
+
+def test_header_date_ignored_when_any_row_has_its_own_date():
+    # 목록 화면: 헤더가 잘린 맨 위 행은 "" 유지, 달력 선택일은 무시
+    assert effective_header_date("07", ["", "", "10-06", "10-05"]) == ""
+    # 일별 보기: 모든 행이 비어 있으면 헤더 날짜 사용
+    assert effective_header_date("07", ["", "", ""]) == "07"
+    assert effective_header_date("", ["", ""]) == ""
+
+
+# ---- v0.10: 캡처 주인 이름 → "본인", self_transfer ----
+
+from f03_extraction import scrub_owner_name, infer_self_transfer
+
+
+def test_scrub_owner_name_exact_and_masked():
+    assert scrub_owner_name("홍길동 → 내 토스뱅크 통장", "홍길동") == ("본인 → 내 토스뱅크 통장", False)
+    assert scrub_owner_name("홍*동 5,000원", "홍길동") == ("본인 5,000원", True)
+    assert scrub_owner_name("홍** 5,000원", "홍길동") == ("본인 5,000원", True)
+    assert scrub_owner_name("김*수", "홍길동") == ("김*수", False)             # 다른 사람
+    assert scrub_owner_name("김*수", "김수") == ("김*수", False)               # 두 글자 이름은 가려진 표기 매칭 안 함
+    assert scrub_owner_name("스타벅스", "") == ("스타벅스", False)
+    assert scrub_owner_name("", "홍길동") == ("", False)
+
+
+def test_infer_self_transfer_rules():
+    assert infer_self_transfer("transfer", "내 계좌 이체 | 토스뱅크 → KB국민", "") == "self_transfer"
+    assert infer_self_transfer("transfer", "본인", "본인 → 내 토스뱅크 통장 본인 → 본인") == "self_transfer"
+    assert infer_self_transfer("transfer", "개인", "내 토스뱅크 통장 → 개인") == "transfer"
+    assert infer_self_transfer("transfer", "개인", "내 토스뱅크 통장 → 본인(모임통장)") == "transfer"   # 괄호 설명은 공동 자금
+    assert infer_self_transfer("refund", "내 계좌 이체 취소", "") == "refund"
+    assert reconcile_kind("self_transfer", "out") == ("self_transfer", False)
+    assert reconcile_kind("self_transfer", "in") == ("self_transfer", False)
+
+
+def test_postprocess_replaces_owner_name_and_lowers_confidence_for_masked():
+    tx = postprocess_row(_row(merchant="홍길동", raw_text="홍길동 5,000원 → 내 토스뱅크 통장", date="10-01", kind="transfer"),
+                         0, "a", "2026-10", "", owner_name="홍길동")
+    assert tx.merchant == "본인" and "홍길동" not in tx.raw_text and tx.confidence == "high"
+    tx = postprocess_row(_row(merchant="홍*동", raw_text="홍*동 5,000원", date="10-01", kind="transfer"),
+                         0, "a", "2026-10", "", owner_name="홍길동")
+    assert tx.merchant == "본인" and tx.confidence == "medium"
+    # 이름을 안 넘기면 아무것도 바꾸지 않음
+    tx = postprocess_row(_row(merchant="홍길동", date="10-01"), 0, "a", "2026-10", "")
+    assert tx.merchant == "홍길동"
+
+
+def test_self_transfer_with_unknown_direction_is_not_gated():
+    tx = postprocess_row(_row(merchant="KB국민", raw_text="1,031,390원 내 계좌 이체 | 본인 → KB국민",
+                             direction="unknown", kind="transfer", date="10-15"), 0, "a", "2026-10", "")
+    assert tx.kind == "self_transfer" and "unknown_direction" not in tx.flags
+    tx = postprocess_row(_row(direction="unknown", kind="transfer", date="10-15"), 0, "a", "2026-10", "")
+    assert "unknown_direction" in tx.flags

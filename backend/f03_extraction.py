@@ -64,9 +64,12 @@ log = logging.getLogger("f03")
 # 1. 설정값
 # ---------------------------------------------------------------------------
 
-MODEL = os.environ.get("F03_MODEL", "claude-sonnet-5-5")  # .env 의 F03_MODEL 로 교체 가능. 평가 세트로 claude-opus-5-5 와 비교 예정
-EXTRACTOR_VERSION = "f03-0.7"           # 코드 변경 시 올림. 결과에 기록해 재추출 비교에 사용
-PROMPT_VERSION = "p3"                   # SYSTEM_PROMPT 수정 시 올림 (p1, p2, ...)
+MODEL = os.environ.get("F03_MODEL", "claude-sonnet-5-5")
+# 캡처 주인의 이름. 온보딩에서 받은 값을 서비스가 호출마다 넘기며, 평가 때는 .env 의 F03_OWNER_NAME 을 씁니다.
+# 저장소·로그·결과 파일 어디에도 적지 않습니다 (결과에는 "본인" 표식만 남음).
+OWNER_NAME = os.environ.get("F03_OWNER_NAME", "").strip()  # .env 의 F03_MODEL 로 교체 가능. 평가 세트로 claude-opus-5-5 와 비교 예정
+EXTRACTOR_VERSION = "f03-0.10"           # 코드 변경 시 올림. 결과에 기록해 재추출 비교에 사용
+PROMPT_VERSION = "p7"                   # SYSTEM_PROMPT 수정 시 올림 (p1, p2, ...)
 EFFORT = "low"                       # 추출은 깊은 추론이 필요 없어서 low. 품질이 부족하면 medium
 MAX_TOKENS = 8000                    # 캡처 1장 = 보통 15행 안팎. 사고 토큰도 여기 포함되므로 여유 있게
 MAX_LONG_EDGE_PX = 1568              # API가 어차피 이 크기로 축소하므로 미리 줄여서 전송량을 아낌
@@ -113,7 +116,7 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
                     "direction": {"type": "string", "enum": ["out", "in", "unknown"]},
                     "kind": {
                         "type": "string",
-                        "enum": ["expense", "income", "transfer", "refund", "cancel", "unknown"],
+                        "enum": ["expense", "income", "transfer", "self_transfer", "refund", "cancel", "unknown"],
                     },
                     "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
                     "raw_text": {"type": "string", "description": "그 행에 보이는 글자를 그대로"},
@@ -148,7 +151,7 @@ class ExtractedRow(BaseModel):
     merchant: str = Field(max_length=100)
     amount_krw: int = Field(ge=0)
     direction: Literal["out", "in", "unknown"]
-    kind: Literal["expense", "income", "transfer", "refund", "cancel", "unknown"]
+    kind: Literal["expense", "income", "transfer", "self_transfer", "refund", "cancel", "unknown"]
     confidence: Literal["high", "medium", "low"]
     raw_text: str
 
@@ -188,13 +191,16 @@ SYSTEM_PROMPT = """당신은 한국 금융 앱(토스, 카카오뱅크, 카카�
   - "+", 파란색 입금 표기, "입금", "급여" → direction "in"
   - 어느 쪽인지 화면만으로 알 수 없으면 "unknown"
 - kind: 일반 결제는 "expense", 입금은 "income", 계좌 이체는 "transfer",
+  본인 계좌 사이의 이동("내 계좌 이체", 양쪽이 모두 본인 계좌)은 "self_transfer",
   "환불"/"취소" 표기가 있으면 각각 "refund"/"cancel", 모르면 "unknown".
 - 날짜에 연도가 없으면 MM-DD 로만 적습니다. 연도를 지어내지 마세요. 사용자 메시지에 이 캡처가
   속한 연·월 힌트가 있으니 displayed_month 는 화면에 실제로 보이는 월 표기를 기준으로 적습니다.
-- 행마다 날짜가 없는 화면이 있습니다(달력에서 하루를 골라 그날 내역만 보여주는 일별 보기, "21일 금요일" 같은 헤더).
-  이때는 각 행의 date 를 "" 로 두고, 헤더·달력에서 선택된 날짜를 header_date 에 적습니다
-  (일만 보이면 "DD", 월·일이 보이면 "MM-DD"). 행에 날짜가 있는 보통 목록 화면에서는 header_date 를 "" 로 둡니다.
-  행에도 헤더에도 날짜가 없으면 둘 다 "" 로 두고 추측하지 않습니다.
+- 날짜의 우선순위: (1) 행 자체에 찍힌 날짜("10.26", "26일 월요일", "10월 26일" 등 그 행 안이나 행 바로 옆에 붙은 표기)
+  → 반드시 그 행의 date 에 적습니다. 행에 날짜 표기가 있는데 비워 두면 안 됩니다. (2) 행 위에 있는 날짜 구분 헤더
+  ("26일 월요일" 같은 줄 아래로 그 날의 행들이 이어지는 형식) → 그 헤더 아래 행들의 date 에 그 날짜를 적습니다.
+  (3) 행에도 구분 헤더에도 없고 화면 상단·달력에서 고른 날짜 하나만 있는 일별 보기 → 각 행의 date 를 "" 로 두고
+  그 날짜를 header_date 에 적습니다 (일만 보이면 "DD", 월·일이 보이면 "MM-DD").
+  행에 날짜가 있는 보통 목록 화면에서는 header_date 를 "" 로 둡니다. 어디에도 날짜가 없으면 둘 다 "" 로 두고 추측하지 않습니다.
 - 시각이 없는 행은 time 을 "" 로 둡니다.
 - merchant 는 화면 표기 그대로(법인명, 지점명 포함) 적습니다. 카테고리로 바꾸지 마세요.
 - raw_text 에는 그 행에 보이는 글자를 순서대로 그대로 옮깁니다.
@@ -202,24 +208,41 @@ SYSTEM_PROMPT = """당신은 한국 금융 앱(토스, 카카오뱅크, 카카�
 - 사람 이름(송금·입금 상대방, 통장 주인)은 개인정보라 추출하지 않습니다. 상대방이 사람 이름이면
   merchant 를 "개인" 으로 적고 kind 는 "transfer" 로 둡니다. raw_text 에서도 이름 자리를 "개인" 으로 바꿉니다.
   상호·법인·서비스명(카카오페이, 네이버파이낸셜, OO식당)은 이름이 아니므로 그대로 적습니다.
+  이름 뒤에 괄호 설명이 붙어도("홍길동(모임통장)", "김철수(생활비)") 사람 이름이므로 "개인" 으로 적습니다.
+  "내 OO 통장 → 상대" 의 상대가 금융기관·가맹점·서비스가 아니면 사람으로 보고 "개인" 으로 적습니다.
+- 사용자 메시지에 이 캡처 주인의 이름이 주어지면, 그 이름이 보이는 자리는 "개인" 대신 "본인" 으로 적습니다
+  (merchant 와 raw_text 모두). 이름 자체는 어디에도 적지 않습니다. 상대가 "본인" 이고 나머지 한쪽이 본인 계좌면
+  kind 는 "self_transfer" 입니다. 단 "홍길동(모임통장)" 처럼 괄호 설명이 붙은 계좌는 본인 명의라도 공동 자금이므로
+  "개인" + "transfer" 로 둡니다. "홍*동" 처럼 가려진 이름은 성과 끝 글자가 주인 이름과 같으면 "본인" 으로 보되
+  confidence 를 "medium" 으로 둡니다.
 
 자주 틀리는 지점 (특히 주의)
 - 숫자 0 과 8, 1 과 7 을 혼동하기 쉽습니다. 쉼표 위치로 자릿수를 다시 확인하세요.
 - 한 행이 두 줄로 표시되는 앱이 있습니다(가맹점명 줄 + 금액/시각 줄). 두 줄을 한 행으로 합칩니다.
 - 화면 맨 위나 아래에 잘린 행은 금액이 온전히 보일 때만 포함하고 confidence 를 "low" 로 둡니다.
   금액이 안 보이는 행(시각이나 잔액만 남은 조각)은 아예 포함하지 않습니다. amount_krw 0 은 쓰지 않습니다.
-- 목록이 최신순이고 맨 위 행들 위에 날짜 헤더가 잘려 안 보이면 그 행들의 date 는 "" 로 둡니다. 아래 헤더 날짜를 빌려 쓰지 않습니다.
+- 목록이 최신순이고 맨 위 행들 위에 날짜 구분 헤더가 잘려 안 보이고 행 자체에도 날짜가 없으면 그 행들의 date 는 "" 로 둡니다.
+  아래 헤더 날짜를 빌려 쓰지 않습니다. 단, 행 자체에 날짜가 찍혀 있으면 헤더가 안 보여도 그 날짜를 적습니다.
 
-결제 내역 화면이 아니면(홈 화면, 광고, 다른 앱) is_transaction_screen 을 false 로 두고 rows 는 빈 배열로 둡니다."""
+결제 내역 화면이 아니면(홈 화면, 광고, 다른 앱) is_transaction_screen 을 false 로 두고 rows 는 빈 배열로 둡니다.
+거래 목록 전체가 아니라 일부만 추려 보여주는 요약 화면도 false 로 둡니다: 월간 달력·카테고리별 합계, "고정지출", "구독",
+"통신요금" 처럼 특정 묶음만 모아 놓은 화면, 정기결제 관리 화면. 이런 화면의 항목은 전체 거래 목록에 이미 들어 있어
+따로 추출하면 중복됩니다. 반면 전체 거래 목록을 날짜·검색어로 걸러 본 화면은 거래 화면입니다."""
 
 
-def _user_prompt(slot_month: str) -> str:
-    """호출마다 달라지는 부분. 슬롯의 연·월만 힌트로 줍니다."""
+def _user_prompt(slot_month: str, owner_name: str = "") -> str:
+    """호출마다 달라지는 부분. 슬롯의 연·월과 캡처 주인의 이름(있으면)을 힌트로 줍니다.
+
+    이름은 시스템 프롬프트(캐시 대상)가 아니라 여기에 넣습니다. 모델은 이름을 출력하지 않고 "본인" 표식만 냅니다.
+    """
     y, m = slot_month.split("-")
-    return (
+    text = (
         f"이 캡처는 {int(y)}년 {int(m)}월 슬롯에 올라온 결제 내역입니다. "
         "화면에 보이는 거래 행을 모두 추출하세요."
     )
+    if owner_name:
+        text += f' 이 캡처 주인의 이름은 "{owner_name}" 입니다. 이 이름이 보이는 자리는 "본인" 으로 적고 이름은 적지 마세요.'
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -322,14 +345,14 @@ def prepare_image(path: Path) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 
-def _build_messages(media_type: str, b64: str, slot_month: str) -> list[dict[str, Any]]:
+def _build_messages(media_type: str, b64: str, slot_month: str, owner_name: str = "") -> list[dict[str, Any]]:
     """이미지 블록을 먼저, 지시 텍스트를 뒤에 두는 것이 비전 요청의 기본 형태입니다."""
     return [
         {
             "role": "user",
             "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
-                {"type": "text", "text": _user_prompt(slot_month)},
+                {"type": "text", "text": _user_prompt(slot_month, owner_name)},
             ],
         }
     ]
@@ -384,6 +407,7 @@ async def extract_one(
     asset_id: str,
     image_path: Path,
     slot_month: str,
+    owner_name: str | None = None,
 ) -> AssetExtraction:
     """
     이미지 한 장을 끝까지 처리합니다: 전처리 → 호출 → 검증(+1회 교정) → 후처리.
@@ -399,7 +423,8 @@ async def extract_one(
         result.error_code, result.error_message = "UNSUPPORTED_MEDIA", str(e)
         return result
 
-    messages = _build_messages(media_type, b64, slot_month)
+    owner_name = OWNER_NAME if owner_name is None else owner_name
+    messages = _build_messages(media_type, b64, slot_month, owner_name)
     parsed: ExtractionOutput | None = None
 
     # 최대 2번 시도: 1차 호출 → (스키마 위반 시) 오류를 알려주고 1번만 교정 재시도.
@@ -467,13 +492,16 @@ async def extract_one(
     result.status = "succeeded"
     result.app_guess, result.displayed_month = parsed.app_guess, parsed.displayed_month
     # 금액이 0 인 행은 잘린 조각(시각·잔액만 보이는 행)이라 거래로 볼 수 없어 버립니다.
-    dropped = sum(1 for r in parsed.rows if r.amount_krw == 0)
+    # 가맹점과 방향이 둘 다 없는 행도 같은 조각입니다: 실측에서 카카오뱅크 맨 위 잘린 행이 한 번은 금액 0,
+    # 다른 실행에서는 잔액(-2,095,864)을 금액으로 들고 나왔습니다. 검토 큐에 올려도 지울 수밖에 없는 행이라 버립니다.
+    header_date = effective_header_date(parsed.header_date, [r.date for r in parsed.rows])
+    rows = [postprocess_row(r, i, asset_id, slot_month, parsed.displayed_month, header_date, owner_name)
+            for i, r in enumerate(parsed.rows) if r.amount_krw != 0]
+    kept = [t for t in rows if not is_fragment(t)]
+    dropped = len(parsed.rows) - len(kept)
     if dropped:
-        log.info("drop zero-amount rows asset=%s n=%d", asset_id, dropped)
-    result.rows = [
-        postprocess_row(r, i, asset_id, slot_month, parsed.displayed_month, parsed.header_date)
-        for i, r in enumerate(parsed.rows) if r.amount_krw != 0
-    ]
+        log.info("drop fragment rows asset=%s n=%d", asset_id, dropped)
+    result.rows = kept
     return result
 
 
@@ -548,6 +576,8 @@ _RE_CARD = re.compile(r"(?<![\d*])(?:[\d*]{4}[ -]){3}[\d*]{4}(?![\d*])")
 _RE_PHONE = re.compile(r"(?<!\d)0\d{1,2}-\d{3,4}-\d{4}(?!\d)")
 _RE_ACCOUNT = re.compile(r"(?<![\d*])(?:[\d*]{1,7}-){1,3}[\d*]{2,}(?![\d*])")   # 그룹 첫 글자가 * 여도 잡음 (마스킹 계좌)
 _RE_LONG_DIGITS = re.compile(r"(?<![\d,])\d{11,}(?![\d,])")                    # 하이픈 없는 계좌·카드. 금액은 쉼표가 있어 안 걸림
+# 사람 이름 + 통장 설명 괄호: "이아림(모임통장)" → "개인". 실측에서 프롬프트 규칙만으로는 새어 나옴.
+_RE_NAME_WITH_ACCOUNT_NOTE = re.compile(r"(?<![가-힣])[가-힣]{2,4}\s*\((?:모임통장|통장|계좌|생활비|용돈|회비)\)")
 _RE_BALANCE = re.compile(r"잔액\s*[:：]?\s*[-+]?[\d,]+\s*원?")
 
 
@@ -566,6 +596,7 @@ def scrub_sensitive(text: str) -> str:
     """
     if not text:
         return text
+    text = _RE_NAME_WITH_ACCOUNT_NOTE.sub("개인", text)
     text = _RE_CARD.sub("[카드]", text)
     text = _RE_PHONE.sub("[전화]", text)
     text = _RE_ACCOUNT.sub(_account_if_enough_digits, text)
@@ -578,7 +609,41 @@ def scrub_sensitive(text: str) -> str:
 # refund / cancel 은 앱마다 표기가 갈립니다(카드사 앱은 "-4,500원 취소" 처럼 음수로, 은행 앱은 "+" 로) → 어느 방향이든 허용.
 # transfer 도 양방향. 모순이면 kind 를 지우지 않고 kind_conflict 플래그만 붙입니다 (지우면 환불이 지출로 집계될 수 있음).
 # F07 집계 규칙: refund / cancel 은 direction 과 무관하게 "지출 차감" 으로 다룹니다.
+# self_transfer(본인 계좌 간 이동)도 양방향. F07 집계 규칙: self_transfer 는 수입·지출 모두에서 제외.
 _KIND_REQUIRES: dict[str, str] = {"income": "in", "expense": "out"}
+
+
+_SELF_TRANSFER_MARKERS = ("내 계좌 이체", "내계좌이체", "내 계좌로 이체", "내 계좌 간 이체")
+
+
+def scrub_owner_name(text: str, owner_name: str) -> tuple[str, bool]:
+    """캡처 주인의 이름이 결과 문자열에 남아 있으면 "본인" 으로 바꿉니다 (프롬프트가 어겨도 저장 데이터엔 이름 없음).
+
+    "홍*동", "홍**" 처럼 가운데가 가려진 표기도 잡되, 그 경우는 (text, True) 로 알려 호출자가 confidence 를 낮춥니다.
+    두 글자 이름은 가려진 표기를 매칭하지 않습니다 (성만 같아도 걸려 과잉 치환).
+    """
+    if not text or not owner_name:
+        return text, False
+    out = text.replace(owner_name, "본인")
+    masked = False
+    if len(owner_name) >= 3:
+        pat = re.escape(owner_name[0]) + r"[*○●]{1,3}" + "(?:" + re.escape(owner_name[-1]) + ")?"
+        new = re.sub(pat, "본인", out)
+        masked = new != out
+        out = new
+    return out, masked
+
+
+def infer_self_transfer(kind: str, merchant: str, raw_text: str) -> str:
+    """앱이 "내 계좌 이체" 라고 명시한 행은 모델 판단과 무관하게 self_transfer 로 둡니다 (결정적 규칙)."""
+    if kind in ("refund", "cancel"):
+        return kind
+    text = f"{merchant} {raw_text}"
+    if any(m in text for m in _SELF_TRANSFER_MARKERS):
+        return "self_transfer"
+    if "(" not in text and "본인 →" in text and "→ 본인" in text:    # 양쪽이 본인 (괄호 설명 있는 모임통장 제외)
+        return "self_transfer"
+    return kind
 
 
 def reconcile_kind(kind: str, direction: str) -> tuple[str, bool]:
@@ -620,12 +685,58 @@ def displayed_month_mismatch(displayed_month: str, slot_month: str) -> bool:
     return m != slot_m
 
 
+def effective_header_date(header_date: str, row_dates: list[str]) -> str:
+    """header_date 는 어느 행에도 날짜가 없는 일별 보기에서만 씁니다.
+
+    실측: 날짜 헤더가 있는 토스 목록 화면에서 모델이 상단 달력의 선택일("07")을 header_date 에 넣는 일이
+    실행에 따라 생겼고, 그러면 헤더가 잘려 날짜를 알 수 없는 맨 위 행들에 07 이 붙어 지어낸 날짜가 됐습니다.
+    행 하나라도 날짜를 가진 화면이면 header_date 를 버립니다.
+    """
+    return "" if any(row_dates) else header_date
+
+
+def is_fragment(tx: "TransactionCandidate") -> bool:
+    """가맹점도 방향도 없는 행. 화면 가장자리에 걸려 금액(또는 잔액)만 보이는 조각입니다."""
+    return "merchant_missing" in tx.flags and tx.direction == "unknown"
+
+
+_RE_WON_AMOUNT = re.compile(r"[-+]?\d{1,3}(?:,\d{3})+원|[-+]?\d+원")
+
+
+def strip_other_amounts(text: str, amount_krw: int) -> str:
+    """raw_text 에서 거래 금액이 아닌 '…원' 토큰을 지웁니다.
+
+    은행 앱은 행마다 거래 후 잔액을 라벨 없이 두 번째 금액으로 찍습니다("개인 5,750원 14:15 -1,934,364원").
+    잔액은 거래 식별에 필요 없고 자산 규모가 드러나는 값이라, 거래 금액과 다른 금액 토큰은 모두 지웁니다.
+    """
+    def keep_or_drop(m: re.Match[str]) -> str:
+        digits = re.sub(r"[^\d]", "", m.group(0))
+        return m.group(0) if digits and int(digits) == amount_krw else ""
+    return re.sub(r"\s{2,}", " ", _RE_WON_AMOUNT.sub(keep_or_drop, text)).strip()
+
+
+def _attach_displayed_month(raw_date: str, displayed_month: str) -> str:
+    """일(DD)만 있는 날짜에 화면 표시 달(·연)을 붙입니다.
+
+    일별 보기 화면은 헤더에 "5일" 만 있고 달은 화면 상단 "10월" 에 있습니다. 전에는 슬롯 달을 붙여
+    10월 캡처를 11월 슬롯에 올리면 11-05 라는 화면에 없는 날짜가 만들어졌습니다 (불일치 플래그는 떴지만
+    날짜 자체가 틀림). 화면에 달이 있으면 그 달을 붙이고, 슬롯과의 불일치 판정은 resolve_date 에 맡깁니다.
+    """
+    if not raw_date or "-" in raw_date:
+        return raw_date
+    y, m = parse_displayed_month(displayed_month)
+    if m is None:
+        return raw_date
+    return f"{y}-{m:02d}-{raw_date}" if y is not None else f"{m:02d}-{raw_date}"
+
+
 def postprocess_row(
-    row: ExtractedRow, index: int, asset_id: str, slot_month: str, displayed_month: str, header_date: str = ""
+    row: ExtractedRow, index: int, asset_id: str, slot_month: str, displayed_month: str, header_date: str = "",
+    owner_name: str = "",
 ) -> TransactionCandidate:
     """모델 출력 한 행 → 검토 표가 쓰는 거래 후보. 숫자·날짜 확정은 전부 여기서."""
     flags: list[str] = []
-    raw_date = row.date or header_date          # 행에 날짜가 없으면 헤더 날짜(일별 보기)를 씀
+    raw_date = _attach_displayed_month(row.date or header_date, displayed_month)   # 행에 날짜가 없으면 헤더 날짜(일별 보기)
     resolved_date, mismatch = resolve_date(raw_date, slot_month) if raw_date else ("", False)
     if not resolved_date:
         # 행에도 헤더에도 날짜가 없거나 읽을 수 없음 → 지어내지 않고 빈 값. F04 검토 큐에서 "필수값 누락"으로
@@ -642,16 +753,21 @@ def postprocess_row(
     header_year_mismatch = resolved_date != "" and not row_has_year and header_y is not None and header_y != slot_y
     if mismatch or header_year_mismatch or (not row.date and displayed_month_mismatch(displayed_month, slot_month)):
         flags.append("month_mismatch")
-    merchant = scrub_sensitive(row.merchant)[:100]
+    merchant, masked_m = scrub_owner_name(scrub_sensitive(row.merchant)[:100], owner_name)
+    raw_text, masked_r = scrub_owner_name(strip_other_amounts(scrub_sensitive(row.raw_text), row.amount_krw), owner_name)
+    confidence = row.confidence
+    if (masked_m or masked_r) and confidence == "high":
+        confidence = "medium"                   # 가려진 이름을 본인으로 본 것은 추정이라 한 단계 낮춤
     if not merchant:
         flags.append("merchant_missing")        # 필수값 누락 (F04 에서 그대로 두기 불가)
-    kind, conflict = reconcile_kind(row.kind, row.direction)
+    kind, conflict = reconcile_kind(infer_self_transfer(row.kind, merchant, raw_text), row.direction)
     if conflict:
         flags.append("kind_conflict")           # 정보성. F04 게이트 대상은 아님
-    if row.confidence == "low":
+    if confidence == "low":
         flags.append("low_confidence")
-    if row.direction == "unknown":
+    if row.direction == "unknown" and kind != "self_transfer":
         flags.append("unknown_direction")       # 합계에서 제외하고 사용자 확인 요청 (F04)
+        # self_transfer 는 방향과 무관하게 집계 제외라 확인을 요구하지 않음 (부호 없는 "A → B" 행이 흔함)
 
     # id 는 (자산, 행 순서, 슬롯) 으로 결정됩니다. 같은 자산을 재추출하면 같은 id 가 나와서
     # 재시도 병합 시 중복 행이 생기지 않고, 달 추가 시 구조화 행 재사용에도 안전합니다.
@@ -668,8 +784,8 @@ def postprocess_row(
         amount_krw=abs(int(row.amount_krw)),
         direction=row.direction,
         kind=kind,
-        confidence=row.confidence,
-        raw_text=scrub_sensitive(row.raw_text),
+        confidence=confidence,
+        raw_text=raw_text,
         flags=flags,
     )
 
@@ -684,6 +800,7 @@ async def run_extraction_job(
     slot_month: str,
     client: anthropic.AsyncAnthropic | None = None,
     concurrency: int = CONCURRENCY,
+    owner_name: str | None = None,
 ) -> ExtractionJobResult:
     """
     assets: [(asset_id, 이미지 경로), ...]  (업로드 단계에서 accepted 된 것만)
@@ -703,7 +820,7 @@ async def run_extraction_job(
     async def guarded(asset_id: str, path: Path) -> AssetExtraction:
         async with sem:
             try:
-                return await extract_one(client, asset_id, path, slot_month)
+                return await extract_one(client, asset_id, path, slot_month, owner_name)
             except Exception as e:  # noqa: BLE001  예상 못한 예외도 "이 장만 실패" 로 가두어 job 전체를 지킵니다
                 # log.exception 은 트레이스백 끝에 str(e) 를 찍어 원문이 섞일 수 있어 타입명만 남깁니다
                 log.error("unexpected error asset=%s type=%s", asset_id, type(e).__name__)
@@ -790,6 +907,18 @@ def job_to_payload(job: ExtractionJobResult, file_of: dict[str, str] | None = No
             for a in job.assets
         ],
     }
+
+
+def job_from_payload(payload: dict[str, Any]) -> ExtractionJobResult:
+    """job_to_payload 의 역변환. 재시도 병합(merge_retry)을 위해 저장해 둔 JSON 을 되살립니다."""
+    assets: list[AssetExtraction] = []
+    for a in payload.get("assets", []):
+        rows = [TransactionCandidate(**{k: r.get(k) for k in TransactionCandidate.__dataclass_fields__})
+                for r in a.get("rows", [])]
+        fields = {k: a.get(k) for k in AssetExtraction.__dataclass_fields__ if k != "rows" and k in a}
+        assets.append(AssetExtraction(**fields, rows=rows))
+    return ExtractionJobResult(job_id=payload["job_id"], slot_month=payload["slot_month"],
+                               status=payload["status"], assets=assets)
 
 
 def retryable_assets(job: ExtractionJobResult) -> list[str]:
