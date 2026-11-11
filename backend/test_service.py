@@ -1,0 +1,116 @@
+# -*- coding: utf-8 -*-
+"""service.py 테스트. 모델 호출은 가짜로 바꿔 API 키 없이 돈다."""
+import io
+import json
+
+import pytest
+from fastapi.testclient import TestClient
+
+import f03_extraction as f03
+import service
+
+
+def _asset(aid, status, code=None, nrows=0):
+    rows = [f03.TransactionCandidate(id=f"tx_{aid}_{i}", asset_id=aid, source_row_id=f"{aid}:row{i:03d}",
+                                     date="2026-10-01", time=None, merchant="m", amount_krw=100, direction="out",
+                                     kind="expense", confidence="high", raw_text="r") for i in range(nrows)]
+    return f03.AssetExtraction(asset_id=aid, status=status, rows=rows, error_code=code)
+
+
+@pytest.fixture
+def client(monkeypatch):
+    calls = []
+
+    async def fake_job(assets, slot_month, client=None, concurrency=5, owner_name=None):
+        calls.append({"ids": [a for a, _ in assets], "slot": slot_month, "owner": owner_name,
+                      "exists": [p.exists() for _, p in assets]})
+        out = []
+        for aid, _ in assets:
+            if aid.startswith("fail"):
+                out.append(_asset(aid, "failed", "RATE_LIMITED"))
+            elif aid.startswith("skip"):
+                out.append(_asset(aid, "skipped", "NOT_TRANSACTION_SCREEN"))
+            else:
+                out.append(_asset(aid, "succeeded", nrows=2))
+        return f03.ExtractionJobResult(job_id="job_test", slot_month=slot_month,
+                                       status=f03.job_status(out), assets=out)
+
+    monkeypatch.setattr(f03, "run_extraction_job", fake_job)
+    c = TestClient(service.app)
+    c.calls = calls
+    return c
+
+
+def _png(name="a.png"):
+    return (name, io.BytesIO(b"\x89PNG\r\n\x1a\n" + b"0" * 64), "image/png")
+
+
+def test_health(client):
+    r = client.get("/health")
+    assert r.status_code == 200 and r.json()["extractor_version"] == f03.EXTRACTOR_VERSION
+
+
+def test_extract_happy_path_and_owner_name_passthrough(client):
+    r = client.post("/extract",
+                    data={"slot_month": "2026-10", "asset_ids": ["17", "18"], "owner_name": " 홍길동 "},
+                    files=[("images", _png("x.png")), ("images", _png("y.jpg"))])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "succeeded" and [a["asset_id"] for a in body["assets"]] == ["17", "18"]
+    assert len(body["assets"][0]["rows"]) == 2 and body["extractor_version"] == f03.EXTRACTOR_VERSION
+    call = client.calls[0]
+    assert call["owner"] == "홍길동" and call["slot"] == "2026-10" and all(call["exists"])
+    assert "홍길동" not in r.text                                       # 응답에 이름 없음
+
+
+def test_extract_validation_errors(client):
+    bad_slot = client.post("/extract", data={"slot_month": "2026-13", "asset_ids": ["1"]}, files=[("images", _png())])
+    assert bad_slot.status_code == 400
+    mismatch = client.post("/extract", data={"slot_month": "2026-10", "asset_ids": ["1", "2"]}, files=[("images", _png())])
+    assert mismatch.status_code == 400
+    dup = client.post("/extract", data={"slot_month": "2026-10", "asset_ids": ["1", "1"]},
+                      files=[("images", _png()), ("images", _png())])
+    assert dup.status_code == 400
+    wrong_type = client.post("/extract", data={"slot_month": "2026-10", "asset_ids": ["1"]},
+                             files=[("images", ("a.gif", io.BytesIO(b"GIF89a"), "image/gif"))])
+    assert wrong_type.status_code == 415
+    assert client.calls == []                                           # 검증 실패 시 모델 호출 없음
+
+
+def test_extract_partial_then_retry_merges(client):
+    first = client.post("/extract", data={"slot_month": "2026-10", "asset_ids": ["ok1", "fail1", "skip1"]},
+                        files=[("images", _png()), ("images", _png()), ("images", _png())]).json()
+    assert first["status"] == "partial"
+    by = {a["asset_id"]: a for a in first["assets"]}
+    assert by["fail1"]["error_code"] == "RATE_LIMITED" and by["skip1"]["status"] == "skipped"
+
+    # 성공한 장을 재시도하려 하면 거부
+    r = client.post("/extract/retry", data={"original_job": json.dumps(first), "asset_ids": ["ok1"]},
+                    files=[("images", _png())])
+    assert r.status_code == 400 and "ok1" in r.text
+
+    # 실패한 장만 재시도 → 병합. 이번엔 성공하도록 id 를 바꿔 보내는 대신 가짜 추출기가 'fail' 접두사로 실패를 내므로
+    # 여전히 실패하는 경우를 먼저 확인
+    r = client.post("/extract/retry", data={"original_job": json.dumps(first), "asset_ids": ["fail1"]},
+                    files=[("images", _png())])
+    assert r.status_code == 200, r.text
+    merged = r.json()
+    assert merged["job_id"] == "job_test" and merged["status"] == "partial"
+    assert merged["retry"]["still_retryable"] == ["fail1"] and merged["retry"]["max_retry_rounds"] == 2
+    assert sum(len(a["rows"]) for a in merged["assets"]) == 2            # 성공 자산 행 수 불변
+
+
+def test_retry_rejects_broken_original(client):
+    r = client.post("/extract/retry", data={"original_job": "{not json", "asset_ids": ["fail1"]},
+                    files=[("images", _png())])
+    assert r.status_code == 400
+
+
+def test_job_payload_round_trip():
+    job = f03.ExtractionJobResult("job_x", "2026-10", "partial",
+                                  [_asset("a", "succeeded", nrows=3), _asset("b", "failed", "NETWORK_ERROR")])
+    back = f03.job_from_payload(json.loads(json.dumps(f03.job_to_payload(job))))
+    assert back.job_id == "job_x" and back.slot_month == "2026-10" and back.status == "partial"
+    assert [a.asset_id for a in back.assets] == ["a", "b"] and len(back.all_rows) == 3
+    assert back.assets[1].error_code == "NETWORK_ERROR"
+    assert f03.retryable_assets(back) == ["b"]
