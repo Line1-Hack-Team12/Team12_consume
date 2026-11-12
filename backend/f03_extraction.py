@@ -68,8 +68,8 @@ MODEL = os.environ.get("F03_MODEL", "claude-sonnet-5-5")
 # 캡처 주인의 이름. 온보딩에서 받은 값을 서비스가 호출마다 넘기며, 평가 때는 .env 의 F03_OWNER_NAME 을 씁니다.
 # 저장소·로그·결과 파일 어디에도 적지 않습니다 (결과에는 "본인" 표식만 남음).
 OWNER_NAME = os.environ.get("F03_OWNER_NAME", "").strip()  # .env 의 F03_MODEL 로 교체 가능. 평가 세트로 claude-opus-5-5 와 비교 예정
-EXTRACTOR_VERSION = "f03-0.10"           # 코드 변경 시 올림. 결과에 기록해 재추출 비교에 사용
-PROMPT_VERSION = "p7"                   # SYSTEM_PROMPT 수정 시 올림 (p1, p2, ...)
+EXTRACTOR_VERSION = "f03-0.11"           # 코드 변경 시 올림. 결과에 기록해 재추출 비교에 사용
+PROMPT_VERSION = "p8"                   # SYSTEM_PROMPT 수정 시 올림 (p1, p2, ...)
 EFFORT = "low"                       # 추출은 깊은 추론이 필요 없어서 low. 품질이 부족하면 medium
 MAX_TOKENS = 8000                    # 캡처 1장 = 보통 15행 안팎. 사고 토큰도 여기 포함되므로 여유 있게
 MAX_LONG_EDGE_PX = 1568              # API가 어차피 이 크기로 축소하므로 미리 줄여서 전송량을 아낌
@@ -193,6 +193,10 @@ SYSTEM_PROMPT = """당신은 한국 금융 앱(토스, 카카오뱅크, 카카�
 - kind: 일반 결제는 "expense", 입금은 "income", 계좌 이체는 "transfer",
   본인 계좌 사이의 이동("내 계좌 이체", 양쪽이 모두 본인 계좌)은 "self_transfer",
   "환불"/"취소" 표기가 있으면 각각 "refund"/"cancel", 모르면 "unknown".
+  간편결제 머니 충전("네이버페이충전", "충전 | 토스뱅크 → 토스페이머니", "OO 결제 충전", "카카오페이 머니 충전")은
+  본인 돈이 은행에서 본인의 페이 머니로 옮겨간 것이므로 "self_transfer" 입니다. 페이 머니에서 본인 계좌로 돌아오는 행
+  ("네이버페이충전 → 내 우리계좌" 입금)도 "self_transfer". 반면 페이 머니로 가맹점에 결제한 행("OO식당 | 토스페이머니")은
+  보통의 "expense" 이고, 남이 보낸 "송금수취" 는 "transfer" 입니다.
 - 날짜에 연도가 없으면 MM-DD 로만 적습니다. 연도를 지어내지 마세요. 사용자 메시지에 이 캡처가
   속한 연·월 힌트가 있으니 displayed_month 는 화면에 실제로 보이는 월 표기를 기준으로 적습니다.
 - 날짜의 우선순위: (1) 행 자체에 찍힌 날짜("10.26", "26일 월요일", "10월 26일" 등 그 행 안이나 행 바로 옆에 붙은 표기)
@@ -219,7 +223,8 @@ SYSTEM_PROMPT = """당신은 한국 금융 앱(토스, 카카오뱅크, 카카�
 자주 틀리는 지점 (특히 주의)
 - 숫자 0 과 8, 1 과 7 을 혼동하기 쉽습니다. 쉼표 위치로 자릿수를 다시 확인하세요.
 - 한 행이 두 줄로 표시되는 앱이 있습니다(가맹점명 줄 + 금액/시각 줄). 두 줄을 한 행으로 합칩니다.
-- 화면 맨 위나 아래에 잘린 행은 금액이 온전히 보일 때만 포함하고 confidence 를 "low" 로 둡니다.
+- 화면 맨 위나 아래에 잘린 행은 금액이 온전히 보일 때만 포함하고 confidence 를 "low" 로 둡니다. 가맹점명 줄이 내비게이션 바나
+  화면 가장자리에 가려 전혀 안 보여도 금액이 온전하면 행을 빼지 말고 merchant 를 "" 로 두세요 (사용자가 검토 큐에서 채웁니다).
   금액이 안 보이는 행(시각이나 잔액만 남은 조각)은 아예 포함하지 않습니다. amount_krw 0 은 쓰지 않습니다.
 - 목록이 최신순이고 맨 위 행들 위에 날짜 구분 헤더가 잘려 안 보이고 행 자체에도 날짜가 없으면 그 행들의 date 는 "" 로 둡니다.
   아래 헤더 날짜를 빌려 쓰지 않습니다. 단, 행 자체에 날짜가 찍혀 있으면 헤더가 안 보여도 그 날짜를 적습니다.
@@ -614,6 +619,29 @@ _KIND_REQUIRES: dict[str, str] = {"income": "in", "expense": "out"}
 
 
 _SELF_TRANSFER_MARKERS = ("내 계좌 이체", "내계좌이체", "내 계좌로 이체", "내 계좌 간 이체")
+# 간편결제 머니 충전: "충전" 과 페이 서비스 표기가 함께 있으면 본인 돈의 이동. 교통카드(티머니) 충전은 지출이라 제외.
+_PAY_TERMS = ("페이", "머니")
+_PAY_TERM_EXCLUDES = ("티머니",)
+# 본인 계좌와 간편결제 회사 사이의 이동("내 우리계좌 → 네이버파이낸셜"). 결제 자금을 당겨간 행이라 페이 쪽 결제 행과 겹친다.
+_PAY_COMPANIES = ("네이버파이낸셜", "네이버페이", "카카오페이", "토스페이", "페이코")
+_RE_OWN_TO_PAY = re.compile(r"내 [^→|]*?(?:계좌|통장) → (?:" + "|".join(_PAY_COMPANIES) + ")")
+_RE_PAY_TO_OWN = re.compile(r"(?:" + "|".join(_PAY_COMPANIES) + r")\S* → 내 [^→|]*?(?:계좌|통장)")
+
+
+def is_pay_charge(text: str) -> bool:
+    if "충전" not in text:
+        return False
+    if "결제 충전" in text:                                   # 토스: 페이 결제를 위해 은행에서 당겨간 행
+        return True
+    t = text
+    for ex in _PAY_TERM_EXCLUDES:
+        t = t.replace(ex, "")
+    return any(p in t for p in _PAY_TERMS)
+
+
+def is_pay_funding(text: str) -> bool:
+    """본인 계좌 ↔ 간편결제 회사 이동. 충전 표기가 없어도 "내 우리계좌 → 네이버파이낸셜" 꼴이면 자금 이동으로 본다."""
+    return bool(_RE_OWN_TO_PAY.search(text) or _RE_PAY_TO_OWN.search(text))
 
 
 def scrub_owner_name(text: str, owner_name: str) -> tuple[str, bool]:
@@ -639,7 +667,7 @@ def infer_self_transfer(kind: str, merchant: str, raw_text: str) -> str:
     if kind in ("refund", "cancel"):
         return kind
     text = f"{merchant} {raw_text}"
-    if any(m in text for m in _SELF_TRANSFER_MARKERS):
+    if any(m in text for m in _SELF_TRANSFER_MARKERS) or is_pay_charge(text) or is_pay_funding(text):
         return "self_transfer"
     if "(" not in text and "본인 →" in text and "→ 본인" in text:    # 양쪽이 본인 (괄호 설명 있는 모임통장 제외)
         return "self_transfer"

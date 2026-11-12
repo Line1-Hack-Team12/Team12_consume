@@ -411,6 +411,23 @@ def test_infer_self_transfer_rules():
     assert infer_self_transfer("transfer", "개인", "내 토스뱅크 통장 → 개인") == "transfer"
     assert infer_self_transfer("transfer", "개인", "내 토스뱅크 통장 → 본인(모임통장)") == "transfer"   # 괄호 설명은 공동 자금
     assert infer_self_transfer("refund", "내 계좌 이체 취소", "") == "refund"
+
+
+def test_pay_money_charge_is_self_transfer():
+    assert infer_self_transfer("expense", "네이버페이충전", "-50,000원 네이버페이충전") == "self_transfer"
+    assert infer_self_transfer("expense", "충전 | 토스뱅크 → 토스페이머니", "") == "self_transfer"
+    assert infer_self_transfer("expense", "뼈옥 파주본점 결제 충전", "") == "self_transfer"          # 토스 "결제 충전"
+    assert infer_self_transfer("income", "네이버페이충전 → 내 우리계좌", "") == "self_transfer"       # 페이 머니 → 본인 계좌
+    assert infer_self_transfer("expense", "뼈옥 파주본점 | 토스페이머니", "") == "expense"            # 페이 머니로 결제한 행은 지출
+    assert infer_self_transfer("expense", "티머니 충전", "") == "expense"                            # 교통카드 충전은 지출
+    assert infer_self_transfer("expense", "스타벅스 카드 충전", "") == "expense"
+    assert infer_self_transfer("transfer", "카카오페이 송금수취", "") == "transfer"
+    assert infer_self_transfer("cancel", "네이버페이충전 취소", "") == "cancel"
+    # 충전 표기 없이 본인 계좌 ↔ 페이 회사 이동
+    assert infer_self_transfer("expense", "네이버파이낸셜", "-3,000원 내 우리계좌 → 네이버파이낸셜") == "self_transfer"
+    assert infer_self_transfer("income", "카카오페이", "50,000원 카카오페이 → 내 토스뱅크 통장") == "self_transfer"
+    assert infer_self_transfer("transfer", "개인", "내 우리계좌 → 개인") == "transfer"
+    assert infer_self_transfer("expense", "네이버파이낸셜", "-3,000원 네이버파이낸셜") == "expense"             # 화살표 없는 결제 행
     assert reconcile_kind("self_transfer", "out") == ("self_transfer", False)
     assert reconcile_kind("self_transfer", "in") == ("self_transfer", False)
 

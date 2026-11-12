@@ -1,6 +1,6 @@
 # AI 서비스 인터페이스 (백엔드 연동용)
 
-이 문서는 Python AI 서비스(`backend/service.py`)의 모든 엔드포인트를 정의한다. 1~5절은 구현됨(추출·파일 파싱), 6~8절은 **계약만 확정**된 상태로 구현 전이다. 백엔드는 6~8절 응답을 목으로 두고 개발하면 된다.
+이 문서는 Python AI 서비스(`backend/service.py`)의 모든 엔드포인트를 정의한다. 1~6절은 구현됨(추출·파일 파싱·분류), 7~8절은 **계약만 확정**된 상태로 구현 전이다. 백엔드는 7~8절 응답을 목으로 두고 개발하면 된다.
 
 AI 파트가 제공하는 것: 캡처 이미지 N장 + 슬롯 달 → 거래 후보 JSON. 호출 단위는 "한 세션의 한 슬롯 달".
 코드: `backend/f03_extraction.py` (Python 3.12, Anthropic SDK). 백엔드는 이 JSON 만 알면 된다.
@@ -106,6 +106,9 @@ AI 파트가 제공하는 것: 캡처 이미지 N장 + 슬롯 달 → 거래 후
 - expense + out → 지출. income + in → 수입.
 - refund / cancel → 방향과 무관하게 지출 차감.
 - self_transfer → 수입·지출 모두 제외 (본인 계좌 간 이동). direction 이 unknown 이어도 검토 큐에 올리지 않음.
+  간편결제 머니 충전("네이버페이충전", "충전 | 토스뱅크 → 토스페이머니", "OO 결제 충전")과 본인 계좌 ↔ 페이 회사 이동("내 우리계좌 → 네이버파이낸셜")도
+  f03-0.11 부터 self_transfer 로 나온다 (결정적 규칙). 백엔드 규칙(F07): 같은 달에 그 간편결제의 결제 행이 하나도 없으면 충전 행을 지출로 되돌린다.
+  교통카드(티머니) 충전은 지출(expense) 그대로.
 - transfer → out 이면 지출, in 이면 수입 (타인과의 이체).
 
 ## 3. 백엔드 엔티티와의 차이 (맞춰야 할 것)
@@ -174,7 +177,7 @@ Spring 쪽 흐름: 세션 생성 시 파일 저장 → 슬롯별로 `/extract` �
 
 같은 달에 캡처와 파일이 둘 다 들어오면 같은 거래가 두 번 생긴다. 백엔드는 (날짜, 금액, 방향) 이 같은 행을 중복 후보로 묶는 기존 로직을 그대로 쓰면 된다.
 
-## 6. 가맹점 분류 `POST /classify` (계약 확정, 구현 전)
+## 6. 가맹점 분류 `POST /classify` (구현됨: `backend/classify.py`)
 
 F07. 가맹점명을 상위 카테고리 7개와 하위 태그로 분류한다. 백엔드가 가맹점 캐시를 먼저 보고, 없는 가맹점만 모아서 한 번에 보낸다.
 
@@ -203,18 +206,19 @@ F07. 가맹점명을 상위 카테고리 7개와 하위 태그로 분류한다. 
     {"merchant": "GS25 역삼점", "category": "living", "subcategory": "편의점", "confidence": "high"},
     {"merchant": "(주)우아한형제들", "category": "delivery", "subcategory": null, "confidence": "high"}
   ],
-  "model": "claude-sonnet-5-5", "prompt_version": "c1"
+  "model": "claude-sonnet-5-5", "prompt_version": "c2"
 }
 ```
 
 | 값 | 허용 |
 |---|---|
 | category | food, delivery, cafe, shopping, transport, living, other |
-| subcategory | food: 외식·주점 / shopping: 온라인·오프라인 / transport: 택시·대중교통 / living: 편의점·구독·주거·통신·의료 / other: 이체·미분류 / 그 외 null |
+| subcategory | food: 외식·주점 / shopping: 온라인·오프라인 / transport: 택시·대중교통 / living: 편의점·구독·주거·통신·의료 / other: 이체·여가·차량·미분류 / 그 외 null |
 | confidence | high, medium, low. low 는 백엔드가 캐시에 넣지 않고 세션 범위로만 쓴다 |
 
 - 응답 순서는 요청 순서와 같고 개수도 같다. 모델이 허용값 밖을 내면 서비스가 other/null/low 로 바꿔 돌려준다 (백엔드는 enum 검증을 다시 할 필요 없음).
-- 소요: 100개 기준 5초 안팎. 같은 세션에서 같은 가맹점을 두 번 보내지 않는다.
+- 소요: 57개 실측 10초. 100개씩 나눠 동시 3묶음까지 호출. 같은 세션에서 같은 가맹점을 두 번 보내지 않는다.
+- 모델 오류·거부·스키마 실패는 그 묶음을 other/미분류/low 로 돌려주고 HTTP 500 을 내지 않는다. 분류 실패가 분석을 막지 않게 하기 위해서다. low 는 캐시에 넣지 않으므로 다음 세션에서 다시 시도된다.
 - 백엔드 규칙(F07): 공통 캐시 저장은 confidence high·medium 만. 사용자 수정은 세션별 override 로 저장하고 캐시보다 우선.
 
 ## 7. 설명 생성 `POST /narrate` (계약 확정, 구현 전)

@@ -9,6 +9,7 @@ F03 추출기 HTTP 서비스. Spring 백엔드가 호출한다.
   POST /extract                    캡처 N장 → job JSON (F03_INTERFACE.md 의 형식)
   POST /extract/retry              실패한 장만 다시 추출하고 원래 job JSON 에 병합해서 돌려줌
   POST /parse                      은행 앱 거래내역 파일(토스뱅크 xlsx) → 같은 모양의 job JSON (달마다 asset 하나)
+  POST /classify                   가맹점명[] → 카테고리·하위 태그 (F07)
 
 설계
   - 동기 응답. 한 장 5~6초, 5장 동시 처리라 10장이면 15초 안팎. Spring 쪽 HTTP 타임아웃은 120초 이상으로.
@@ -26,10 +27,12 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel, Field
 from fastapi.responses import JSONResponse
 
 import f03_extraction as f03
 from bank_file_parser import EncryptedFileError, UnsupportedFileError, parse_bank_file, parsed_to_payload
+import classify as f07
 
 log = logging.getLogger("f03.service")
 
@@ -171,3 +174,21 @@ async def parse_file(
     log.info("parse format=%s rows=%d months=%d skipped=%d", parsed.source_format, len(parsed.rows),
              len(payload["assets"]), parsed.skipped_rows)
     return JSONResponse(payload)
+
+
+class ClassifyRequest(BaseModel):
+    items: list[f07.ClassifyItem] = Field(..., max_length=1000)
+
+
+@app.post("/classify")
+async def classify_merchants(req: ClassifyRequest) -> JSONResponse:
+    """가맹점명을 카테고리로 분류한다 (F03_INTERFACE.md 6절). 응답 순서·개수는 요청과 같다.
+
+    - 100개씩 나눠 동시 호출. 모델 오류·거부·스키마 실패는 해당 묶음을 other/미분류/low 로 돌려주고 500 을 내지 않는다.
+    - 허용값 밖 출력은 서비스가 교정하므로 백엔드는 enum 검증이 필요 없다.
+    """
+    if not req.items:
+        return JSONResponse(f07.to_payload([]))
+    results = await f07.classify(req.items)
+    log.info("classify n=%d low=%d", len(results), sum(c.confidence == "low" for c in results))
+    return JSONResponse(f07.to_payload(results))

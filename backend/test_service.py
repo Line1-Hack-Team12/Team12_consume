@@ -148,3 +148,21 @@ def test_parse_endpoint_errors():
     bad_month = c.post("/parse", data={"asset_id": "1", "months": ["2026-13"]},
                        files=[("file", ("a.xlsx", io.BytesIO(_toss_xlsx(ROWS)), "application/octet-stream"))])
     assert bad_month.status_code == 400
+
+
+
+# ---- /classify ----
+
+def test_classify_endpoint_keeps_order(monkeypatch):
+    import classify as f07
+
+    async def fake_classify(items, client=None, concurrency=3):
+        return [f07.Classification(it.merchant, "living", "편의점", "high") for it in items]
+
+    monkeypatch.setattr(f07, "classify", fake_classify)
+    c = TestClient(service.app)
+    r = c.post("/classify", json={"items": [{"merchant": "GS25 역삼점", "kind": "expense"}, {"merchant": "CU", "kind": "expense", "raw_text": "x"}]})
+    assert r.status_code == 200 and [i["merchant"] for i in r.json()["items"]] == ["GS25 역삼점", "CU"]
+    assert r.json()["items"][0]["subcategory"] == "편의점"
+    assert c.post("/classify", json={"items": []}).json()["items"] == []
+    assert c.post("/classify", json={"items": [{"kind": "expense"}]}).status_code == 422
