@@ -159,11 +159,11 @@ async def classify_batch(client: anthropic.AsyncAnthropic, items: list[ClassifyI
             return [Classification(it.merchant, *FALLBACK) for it in items]
         if msg.stop_reason == "refusal":
             return [Classification(it.merchant, *FALLBACK) for it in items]
-        text = _first_text(msg)
         try:
+            text = _first_text(msg)                                   # 사고만 하다 max_tokens 에 끝나면 text 블록이 없음
             parsed = _ModelOut.model_validate_json(text)
             break
-        except ValidationError:
+        except (ValueError, ValidationError):
             if attempt == 0:
                 messages = messages + [{"role": "assistant", "content": msg.content},
                                        {"role": "user", "content": "출력이 스키마와 맞지 않습니다. 스키마에 맞는 JSON 만 다시 출력하세요."}]

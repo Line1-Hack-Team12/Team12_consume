@@ -450,3 +450,16 @@ def test_self_transfer_with_unknown_direction_is_not_gated():
     assert tx.kind == "self_transfer" and "unknown_direction" not in tx.flags
     tx = postprocess_row(_row(direction="unknown", kind="transfer", date="10-15"), 0, "a", "2026-10", "")
     assert "unknown_direction" in tx.flags
+
+
+def test_scrub_owner_name_respects_hangul_boundaries():
+    assert scrub_owner_name("하나은행 ATM 출금", "하나") == ("하나은행 ATM 출금", False)       # 이름이 상호의 일부
+    assert scrub_owner_name("서현역 스타벅스", "서현") == ("서현역 스타벅스", False)
+    assert scrub_owner_name("하나 → 내 토스뱅크 통장", "하나") == ("본인 → 내 토스뱅크 통장", False)
+    assert scrub_owner_name("이체 하나(생활비)", "하나") == ("이체 본인(생활비)", False)
+    assert scrub_owner_name("홍길동은행", "홍길동") == ("홍길동은행", False)
+    assert scrub_owner_name("김홍길동", "홍길동") == ("김홍길동", False)
+    assert scrub_owner_name("홍*동은행", "홍길동") == ("홍*동은행", False)
+    assert scrub_owner_name("가나다라", "가") == ("가나다라", False)                            # 한 글자 이름은 무시
+    assert scrub_owner_name("홍길동님 입금", "홍길동") == ("본인 입금", False)                   # 존칭은 이름과 함께 치환
+    assert scrub_owner_name("홍*동님 입금", "홍길동") == ("본인 입금", True)

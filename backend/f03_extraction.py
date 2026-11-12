@@ -69,7 +69,7 @@ MODEL = os.environ.get("F03_MODEL", "claude-sonnet-5-5")
 # 저장소·로그·결과 파일 어디에도 적지 않습니다 (결과에는 "본인" 표식만 남음).
 OWNER_NAME = os.environ.get("F03_OWNER_NAME", "").strip()  # .env 의 F03_MODEL 로 교체 가능. 평가 세트로 claude-opus-5-5 와 비교 예정
 EXTRACTOR_VERSION = "f03-0.11"           # 코드 변경 시 올림. 결과에 기록해 재추출 비교에 사용
-PROMPT_VERSION = "p8"                   # SYSTEM_PROMPT 수정 시 올림 (p1, p2, ...)
+PROMPT_VERSION = "p9"                   # SYSTEM_PROMPT 수정 시 올림 (p1, p2, ...)
 EFFORT = "low"                       # 추출은 깊은 추론이 필요 없어서 low. 품질이 부족하면 medium
 MAX_TOKENS = 8000                    # 캡처 1장 = 보통 15행 안팎. 사고 토큰도 여기 포함되므로 여유 있게
 MAX_LONG_EDGE_PX = 1568              # API가 어차피 이 크기로 축소하므로 미리 줄여서 전송량을 아낌
@@ -196,7 +196,8 @@ SYSTEM_PROMPT = """당신은 한국 금융 앱(토스, 카카오뱅크, 카카�
   간편결제 머니 충전("네이버페이충전", "충전 | 토스뱅크 → 토스페이머니", "OO 결제 충전", "카카오페이 머니 충전")은
   본인 돈이 은행에서 본인의 페이 머니로 옮겨간 것이므로 "self_transfer" 입니다. 페이 머니에서 본인 계좌로 돌아오는 행
   ("네이버페이충전 → 내 우리계좌" 입금)도 "self_transfer". 반면 페이 머니로 가맹점에 결제한 행("OO식당 | 토스페이머니")은
-  보통의 "expense" 이고, 남이 보낸 "송금수취" 는 "transfer" 입니다.
+  보통의 "expense" 이고, 남이 보낸 "송금수취" 는 "transfer" 입니다. 교통카드(티머니·캐시비) 충전, 상품권·기프트카드 구매,
+  게임·앱 머니 충전은 돈이 남에게 간 것이라 "expense" 입니다 (본인 페이 머니 충전만 "self_transfer").
 - 날짜에 연도가 없으면 MM-DD 로만 적습니다. 연도를 지어내지 마세요. 사용자 메시지에 이 캡처가
   속한 연·월 힌트가 있으니 displayed_month 는 화면에 실제로 보이는 월 표기를 기준으로 적습니다.
 - 날짜의 우선순위: (1) 행 자체에 찍힌 날짜("10.26", "26일 월요일", "10월 26일" 등 그 행 안이나 행 바로 옆에 붙은 표기)
@@ -649,13 +650,15 @@ def scrub_owner_name(text: str, owner_name: str) -> tuple[str, bool]:
 
     "홍*동", "홍**" 처럼 가운데가 가려진 표기도 잡되, 그 경우는 (text, True) 로 알려 호출자가 confidence 를 낮춥니다.
     두 글자 이름은 가려진 표기를 매칭하지 않습니다 (성만 같아도 걸려 과잉 치환).
+    이름 앞뒤에 다른 한글이 붙어 있으면 이름이 아닙니다 ("하나" 와 "하나은행", "서현" 과 "서현역"). 한 글자 이름은 무시합니다.
     """
-    if not text or not owner_name:
+    if not text or not owner_name or len(owner_name) < 2:
         return text, False
-    out = text.replace(owner_name, "본인")
+    bound = r"(?<![가-힣])", r"(?![가-힣])"
+    out = re.sub(bound[0] + re.escape(owner_name) + r"(?:님|씨)?" + bound[1], "본인", text)     # "홍길동님" 도 통째로
     masked = False
     if len(owner_name) >= 3:
-        pat = re.escape(owner_name[0]) + r"[*○●]{1,3}" + "(?:" + re.escape(owner_name[-1]) + ")?"
+        pat = bound[0] + re.escape(owner_name[0]) + r"[*○●]{1,3}" + "(?:" + re.escape(owner_name[-1]) + ")?" + r"(?:님|씨)?" + bound[1]
         new = re.sub(pat, "본인", out)
         masked = new != out
         out = new

@@ -132,3 +132,18 @@ def test_encrypted_file_opens_with_password_and_rejects_wrong_one():
     assert "000000" not in str(e.value)                                           # 오류 메시지에 암호 없음
     with pytest.raises(EncryptedFileError):
         parse_bank_file(enc, "a.xlsx", "f1")
+
+
+def test_duplicate_months_yield_one_asset_each():
+    parsed = parse_bank_file(_toss_xlsx(ROWS), "a.xlsx", "f1")
+    payload = parsed_to_payload(parsed, "f1", ["2026-10", "2026-10", "2026-09"])
+    assert [a["asset_id"] for a in payload["assets"]] == ["f1:2026-10", "f1:2026-09"]
+
+
+def test_corrupt_or_legacy_files_map_to_contract_errors():
+    with pytest.raises(UnsupportedFileError):                      # PK 로 시작하지만 깨진 zip
+        parse_bank_file(b"PK\x03\x04" + b"\x00" * 64, "a.xlsx", "f1")
+    with pytest.raises(UnsupportedFileError):                      # 구형 xls 확장자
+        parse_bank_file(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64, "a.xls", "f1", password="x")
+    with pytest.raises(EncryptedFileError):                        # OLE 헤더인데 암호화 파일이 아님 → msoffcrypto 예외도 422 로
+        parse_bank_file(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64, "a.xlsx", "f1", password="x")

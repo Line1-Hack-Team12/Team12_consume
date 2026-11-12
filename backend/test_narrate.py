@@ -186,3 +186,12 @@ def test_render_uses_korean_weekday_and_allowed_numbers():
     assert "13주 중 11회" in text and "286,000원" in text and "380,000원" in text
     assert "tx_a | 2026-10-23 22:14 | (주)우아한형제들 | 27,000원" in text
     assert "이 카드에서 쓸 수 있는 숫자" in text
+
+
+def test_no_text_block_or_truncation_is_corrected_once_then_invalid():
+    thinking_only = SimpleNamespace(stop_reason="max_tokens", content=[SimpleNamespace(type="thinking", thinking="...")])
+    fake = FakeClient([thinking_only, _msg(GOOD)])
+    out = asyncio.run(nr.narrate(_req(), client=fake))
+    assert out["cards"][0]["pattern_id"] == "pat_3" and "잘렸습니다" in fake.calls[1]["messages"][-1]["content"]
+    with pytest.raises(NarrateInvalid):
+        asyncio.run(nr.narrate(_req(), client=FakeClient([thinking_only, thinking_only])))

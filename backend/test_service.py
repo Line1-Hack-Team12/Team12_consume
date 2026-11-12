@@ -214,3 +214,13 @@ def test_notify_copy_endpoint(monkeypatch):
     monkeypatch.setattr(f14, "notify_copy", invalid)
     assert c.post("/notify-copy", json=REQ).status_code == 422
     assert c.post("/notify-copy", json={**REQ, "cause_tags": ["bored"]}).status_code == 422
+
+
+# ---- cold review 반영: 잘못된 original_job 모양은 400 ----
+
+def test_retry_rejects_wrong_shaped_original(client):
+    for bad in ["[]", "123", '{"job_id": "j", "slot_month": null, "status": "partial", "assets": []}',
+                '{"job_id": "j", "slot_month": "2026-10", "status": "partial", "assets": [{"asset_id": "a", "rows": [1]}]}']:
+        r = client.post("/extract/retry", data={"original_job": bad, "asset_ids": ["x"]},
+                        files=[("images", ("x.png", b"\x89PNG", "image/png"))])
+        assert r.status_code == 400, (bad, r.status_code, r.text)

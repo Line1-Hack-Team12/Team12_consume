@@ -91,3 +91,10 @@ def test_classify_splits_batches_and_preserves_order(monkeypatch):
     assert seen == [100, 100, 30] and [c.merchant for c in out] == [f"m{i}" for i in range(230)]
     payload = to_payload(out)
     assert len(payload["items"]) == 230 and payload["prompt_version"] == cl.PROMPT_VERSION
+
+
+def test_no_text_block_falls_back_instead_of_raising():
+    items = [ClassifyItem(merchant="A")]
+    thinking_only = SimpleNamespace(stop_reason="max_tokens", content=[SimpleNamespace(type="thinking", thinking="...")])
+    out = asyncio.run(classify_batch(FakeClient([thinking_only, thinking_only]), items))
+    assert (out[0].category, out[0].confidence) == ("other", "low")

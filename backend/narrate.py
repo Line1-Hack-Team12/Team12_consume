@@ -506,6 +506,16 @@ def _first_text(message: anthropic.types.Message) -> str:
     raise ValueError("no text block")
 
 
+def _parse_or_errors(message: anthropic.types.Message, model_cls: type[BaseModel]) -> tuple[BaseModel | None, list[str]]:
+    """응답에서 JSON 을 꺼낸다. text 블록이 없거나(max_tokens 로 사고만 하다 끝남) 스키마가 틀리면 오류 목록을 돌려준다."""
+    if message.stop_reason == "max_tokens":
+        return None, ["출력이 길이 제한에 잘렸습니다. 더 짧게 쓰세요"]
+    try:
+        return model_cls.model_validate_json(_first_text(message)), []
+    except (ValueError, ValidationError) as e:
+        return None, [f"출력이 JSON 스키마와 맞지 않습니다 ({type(e).__name__})"]
+
+
 class _Refused(Exception):
     pass
 
@@ -518,12 +528,10 @@ async def _generate(client: anthropic.AsyncAnthropic, req: NarrateRequest, tone:
         msg = await _call(client, messages)
         if msg.stop_reason == "refusal":
             raise _Refused()
-        text = _first_text(msg)
-        try:
-            parsed = _ModelOut.model_validate_json(text)
+        parsed, errors = _parse_or_errors(msg, _ModelOut)
+        fixed: dict[str, Any] = {}
+        if parsed is not None:
             fixed, errors = validate_output(req, parsed.model_dump())
-        except ValidationError as e:
-            fixed, errors = {}, [f"schema: {type(e).__name__}"]
         if not errors:
             log.info("narrate ok tone=%s attempt=%d cards=%d", tone, attempt + 1, len(fixed["cards"]))
             return fixed

@@ -127,18 +127,20 @@ def _open_workbook(data: bytes, password: str | None):
         if not password:
             raise EncryptedFileError("파일에 열기 암호가 걸려 있습니다. 발급 시 안내된 비밀번호가 필요합니다.")
         import msoffcrypto                                     # 암호 있을 때만 import
-        f = msoffcrypto.OfficeFile(io.BytesIO(data))
-        f.load_key(password=password)
         out = io.BytesIO()
         try:
+            f = msoffcrypto.OfficeFile(io.BytesIO(data))
+            f.load_key(password=password)
             f.decrypt(out)
-        except Exception as e:                                 # 잘못된 암호 등. 메시지에 암호를 넣지 않음
+        except Exception as e:                                 # 잘못된 암호, 암호화 아닌 구형 xls 등. 메시지에 암호를 넣지 않음
             raise EncryptedFileError(f"암호로 파일을 열 수 없습니다 ({type(e).__name__})")
-        out.seek(0)
-        return load_workbook(out, read_only=True, data_only=True)
+        data = out.getvalue()
     if data[:2] != b"PK":
         raise UnsupportedFileError("xlsx 형식이 아닙니다")
-    return load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    try:
+        return load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    except Exception as e:                                     # 깨진 zip, xlsx 가 아닌 zip 등
+        raise UnsupportedFileError(f"xlsx 파일을 열 수 없습니다 ({type(e).__name__})")
 
 
 def _find_header(rows: list[tuple[Any, ...]], required: tuple[str, ...], scan: int = 40) -> tuple[int, dict[str, int]]:
@@ -236,8 +238,10 @@ def parse_bank_file(data: bytes, filename: str, asset_id: str, owner_name: str =
                     password: str | None = None) -> ParsedFile:
     """파일 형식을 보고 맞는 파서로 보낸다. 지금은 토스뱅크 xlsx 만."""
     suffix = Path(filename or "").suffix.lower()
-    if suffix in (".xlsx", ".xlsm", ".xls"):
+    if suffix in (".xlsx", ".xlsm"):
         return parse_toss_xlsx(data, asset_id, owner_name, password)
+    if suffix == ".xls":
+        raise UnsupportedFileError("구형 xls 는 지원하지 않습니다. 은행 앱에서 xlsx 로 다시 내려받아 주세요")
     raise UnsupportedFileError(f"지원하지 않는 파일 형식: {suffix or '(없음)'}")
 
 
@@ -247,7 +251,7 @@ def parsed_to_payload(parsed: ParsedFile, asset_id: str, months: list[str] | Non
     months 를 주면 그 달들만 돌려준다 (세션의 슬롯 달). 안 주면 파일에 있는 모든 달.
     """
     by_month = parsed.by_month()
-    wanted = months or list(by_month)
+    wanted = list(dict.fromkeys(months)) if months else list(by_month)     # 같은 달이 두 번 오면 한 번만
     assets = []
     for m in wanted:
         rows = by_month.get(m, [])

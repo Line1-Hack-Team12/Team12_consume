@@ -101,3 +101,9 @@ def test_other_category_words_are_rejected():
     assert len(errors) == 1 and "배달" in errors[0]
     nocat = copy.deepcopy(REQ); nocat["pattern"]["condition"] = {"weekday": 3}
     assert validate_output(NotifyRequest.model_validate(nocat), {"title": "배달 택시", "body": "13주 중 11주."})[1] == []
+
+
+def test_no_text_block_does_not_raise_500():
+    thinking_only = SimpleNamespace(stop_reason="max_tokens", content=[SimpleNamespace(type="thinking", thinking="...")])
+    with pytest.raises(NotifyInvalid):
+        asyncio.run(nf.notify_copy(_req(), client=FakeClient([thinking_only, thinking_only])))

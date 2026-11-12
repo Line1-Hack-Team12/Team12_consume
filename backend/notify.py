@@ -16,9 +16,9 @@ import os
 from typing import Any, Literal
 
 import anthropic
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, field_validator
 
-from narrate import (TAGS, TYPE_KO, PATTERN_TYPES, Observed, NarrateInvalid, _first_text, _fmt_num, _nums_from_date,
+from narrate import (TAGS, TYPE_KO, PATTERN_TYPES, Observed, NarrateInvalid, _fmt_num, _nums_from_date, _parse_or_errors,
                      describe_condition, numbers_in)
 
 log = logging.getLogger("f14.notify")
@@ -189,11 +189,10 @@ async def _generate(client: anthropic.AsyncAnthropic, req: NotifyRequest, tone: 
         msg = await _call(client, messages)
         if msg.stop_reason == "refusal":
             raise _Refused()
-        try:
-            parsed = _ModelOut.model_validate_json(_first_text(msg))
+        parsed, errors = _parse_or_errors(msg, _ModelOut)
+        fixed: dict[str, str] = {}
+        if parsed is not None:
             fixed, errors = validate_output(req, parsed.model_dump())
-        except ValidationError as e:
-            fixed, errors = {}, [f"schema: {type(e).__name__}"]
         if not errors:
             return fixed
         last = errors

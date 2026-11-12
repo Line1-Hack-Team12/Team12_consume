@@ -119,8 +119,13 @@ async def extract_retry(
     - 응답은 병합된 job JSON (job_id 는 원래 것 유지). 또 실패한 장은 그대로 failed 로 남고 status 는 partial.
     """
     try:
-        original = f03.job_from_payload(json.loads(original_job))
-    except (ValueError, KeyError, TypeError) as e:
+        payload_in = json.loads(original_job)
+        if not isinstance(payload_in, dict):
+            raise TypeError("not an object")
+        original = f03.job_from_payload(payload_in)
+        if not isinstance(original.slot_month, str) or not isinstance(original.assets, list):
+            raise TypeError("bad shape")
+    except (ValueError, KeyError, TypeError, AttributeError) as e:       # JSON 아님, 배열, 필드 누락, 행이 dict 아님 등
         raise HTTPException(400, f"original_job 을 읽을 수 없습니다: {type(e).__name__}")
     _validate_common(original.slot_month, images, asset_ids)
 
