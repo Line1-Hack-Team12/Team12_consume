@@ -1,4 +1,6 @@
-# F03 추출기 인터페이스 (백엔드 연동용)
+# AI 서비스 인터페이스 (백엔드 연동용)
+
+이 문서는 Python AI 서비스(`backend/service.py`)의 모든 엔드포인트를 정의한다. 1~5절은 구현됨(추출·파일 파싱), 6~8절은 **계약만 확정**된 상태로 구현 전이다. 백엔드는 6~8절 응답을 목으로 두고 개발하면 된다.
 
 AI 파트가 제공하는 것: 캡처 이미지 N장 + 슬롯 달 → 거래 후보 JSON. 호출 단위는 "한 세션의 한 슬롯 달".
 코드: `backend/f03_extraction.py` (Python 3.12, Anthropic SDK). 백엔드는 이 JSON 만 알면 된다.
@@ -172,7 +174,167 @@ Spring 쪽 흐름: 세션 생성 시 파일 저장 → 슬롯별로 `/extract` �
 
 같은 달에 캡처와 파일이 둘 다 들어오면 같은 거래가 두 번 생긴다. 백엔드는 (날짜, 금액, 방향) 이 같은 행을 중복 후보로 묶는 기존 로직을 그대로 쓰면 된다.
 
-## 6. 환경
+## 6. 가맹점 분류 `POST /classify` (계약 확정, 구현 전)
+
+F07. 가맹점명을 상위 카테고리 7개와 하위 태그로 분류한다. 백엔드가 가맹점 캐시를 먼저 보고, 없는 가맹점만 모아서 한 번에 보낸다.
+
+요청 (JSON):
+
+```json
+{
+  "items": [
+    {"merchant": "GS25 역삼점", "kind": "expense", "raw_text": "-4,500원 GS25 역삼점 | 토스뱅크 체크카드"},
+    {"merchant": "(주)우아한형제들", "kind": "expense", "raw_text": null}
+  ]
+}
+```
+
+| 필드 | 설명 |
+|---|---|
+| items[].merchant | 추출 결과의 merchant 그대로. 한 번에 최대 100개, 중복은 백엔드가 제거 |
+| items[].kind | 추출 결과의 kind. expense·refund·cancel 외(income, transfer, self_transfer)는 보내지 않는다 (분류 대상 아님) |
+| items[].raw_text | 선택. 결제 수단·메모가 분류에 도움이 될 때 |
+
+응답:
+
+```json
+{
+  "items": [
+    {"merchant": "GS25 역삼점", "category": "living", "subcategory": "편의점", "confidence": "high"},
+    {"merchant": "(주)우아한형제들", "category": "delivery", "subcategory": null, "confidence": "high"}
+  ],
+  "model": "claude-sonnet-5-5", "prompt_version": "c1"
+}
+```
+
+| 값 | 허용 |
+|---|---|
+| category | food, delivery, cafe, shopping, transport, living, other |
+| subcategory | food: 외식·주점 / shopping: 온라인·오프라인 / transport: 택시·대중교통 / living: 편의점·구독·주거·통신·의료 / other: 이체·미분류 / 그 외 null |
+| confidence | high, medium, low. low 는 백엔드가 캐시에 넣지 않고 세션 범위로만 쓴다 |
+
+- 응답 순서는 요청 순서와 같고 개수도 같다. 모델이 허용값 밖을 내면 서비스가 other/null/low 로 바꿔 돌려준다 (백엔드는 enum 검증을 다시 할 필요 없음).
+- 소요: 100개 기준 5초 안팎. 같은 세션에서 같은 가맹점을 두 번 보내지 않는다.
+- 백엔드 규칙(F07): 공통 캐시 저장은 confidence high·medium 만. 사용자 수정은 세션별 override 로 저장하고 캐시보다 우선.
+
+## 7. 설명 생성 `POST /narrate` (계약 확정, 구현 전)
+
+F11·F15·F16. 백엔드가 계산한 패턴 수치로 카드 문장·가설 질문·행동 제안·태그 추천·총평을 만든다. **숫자와 거래 ID 는 입력을 그대로 쓰고, 서비스가 검증한다.** 말투를 바꿀 때도 같은 요청에 tone 만 바꿔 다시 부른다 (분석 재실행 없음). 백엔드는 (snapshot_id, tone) 으로 결과를 캐시한다.
+
+요청 (JSON):
+
+```json
+{
+  "snapshot_id": "snap_12",
+  "tone": "coach",
+  "period": {"start": "2026-08-01", "end": "2026-10-31", "slots": ["2026-08", "2026-09", "2026-10"]},
+  "want": ["cards", "summary", "report"],
+  "patterns": [
+    {
+      "pattern_id": "pat_3",
+      "type": "weekday",
+      "condition": {"weekday": 4, "hour_from": 21, "hour_to": 24, "category": "delivery", "subcategory": null, "weather": null},
+      "observed": {"hit": 11, "window": 13, "unit": "주"},
+      "sum_krw": 286000,
+      "chained_sum_krw": 94000,
+      "evidence_grade": "strong",
+      "evidence_transactions": [
+        {"id": "tx_3f9a1c02b7", "date": "2026-10-23", "time": "22:14", "merchant": "(주)우아한형제들", "amount_krw": 27000, "category": "delivery", "subcategory": null},
+        {"id": "tx_8b2e...", "date": "2026-10-16", "time": "21:50", "merchant": "(주)우아한형제들", "amount_krw": 24500, "category": "delivery", "subcategory": null}
+      ],
+      "chain_transactions": [
+        {"id": "tx_c1...", "date": "2026-10-24", "time": "10:40", "merchant": "CU 역삼점", "amount_krw": 6800, "category": "living", "subcategory": "편의점", "lag_minutes": 746}
+      ]
+    }
+  ],
+  "summary": {
+    "total_spend_krw": 1243500,
+    "by_category": [{"category": "food", "sum_krw": 412000, "share": 0.33}],
+    "by_month": [{"month": "2026-08", "sum_krw": 401000}],
+    "limits": {"days_without_upload": 4, "transactions_without_time": 12, "weather_skipped": true}
+  },
+  "subscriptions": [{"merchant": "유튜브 프리미엄", "monthly_krw": 14900, "observed_months": 3, "price_increased": false}]
+}
+```
+
+| 필드 | 설명 |
+|---|---|
+| tone | coach, friend, grandma |
+| want | 생성할 것. cards(카드 문장), summary(결과 홈 요약 한 줄), report(리포트 총평·관찰·행동·한계) 중 선택 |
+| patterns[].type | weekday, late_night, rain, chain, next_morning_chain, payday |
+| patterns[].condition | 탐지기 조건. 문장에 쓸 사실 (요일·시간대·카테고리·날씨) |
+| patterns[].observed | "13주 중 11회" 의 숫자. 문장은 이 숫자만 쓴다 |
+| evidence_transactions | 카드에 보여줄 증거. 3건 이상 권장, 최대 10건. id 는 snapshot 의 거래 id |
+| chain_transactions | 후속 결제. chained_sum_krw 의 근거 |
+| summary, subscriptions | want 에 summary·report 가 있을 때만 필요 |
+
+응답:
+
+```json
+{
+  "cards": [
+    {
+      "pattern_id": "pat_3",
+      "title": "목요일 밤 배달",
+      "observation": "최근 13주 중 11주, 목요일 21시 이후에 배달 주문이 있었어요. 직접 비용 286,000원에 다음날 편의점·카페 94,000원이 따라왔어요.",
+      "hypothesis_question": "목요일 밤에 유독 주문이 몰리는 이유가 있을까요?",
+      "action": "목요일 저녁에는 주문 전에 냉장고를 한 번 열어 보세요.",
+      "recommended_tags": ["overtime", "stress", "habit"],
+      "evidence_transaction_ids": ["tx_3f9a1c02b7", "tx_8b2e..."]
+    }
+  ],
+  "summary_line": "지난 3개월, 목요일 밤 배달이 가장 큰 반복 지출이었어요.",
+  "report": {
+    "overview": ["문장 1", "문장 2", "문장 3"],
+    "observations": [{"pattern_id": "pat_3", "sentence": "..."}],
+    "actions": ["...", "..."],
+    "limits_sentence": "업로드가 없는 날 4일과 시각이 없는 거래 12건은 시간대 분석에서 빠졌어요."
+  },
+  "model": "claude-sonnet-5-5", "prompt_version": "n1", "tone": "coach"
+}
+```
+
+서비스가 보장하는 것 (백엔드는 저장만 하면 됨):
+
+- `evidence_transaction_ids` 는 요청의 evidence id 부분집합. 없는 id 가 나오면 1회 교정 재시도, 그래도 틀리면 HTTP 422 `ANALYSIS_OUTPUT_INVALID`.
+- 문장에 나오는 금액·횟수는 요청 숫자와 일치 (서비스가 문장의 숫자를 뽑아 대조). 어긋나면 위와 같이 처리.
+- `recommended_tags` 는 F13 허용값(overtime, rain, stress, habit, no_specific_reason) 중 3개. custom 은 추천하지 않는다.
+- observation 은 관찰 사실만("비 오는 날 배달 2건"), 원인 단정 없음. hypothesis_question 은 질문 한 문장, action 은 한 문장.
+- 말투 변환 실패 시 중립 표현으로 대체하고 응답 `tone` 에 "neutral" 을 적는다.
+- 소요: 카드 5장 + 요약 + 리포트 기준 15초 안팎. 백엔드는 세션 상태 ANALYZING 으로 두고 호출.
+
+## 8. 알림 문구 `POST /notify-copy` (계약 확정, 구현 전)
+
+F14. 카드 토글을 켜거나 태그를 바꿀 때 알림 미리보기 문구를 만든다. 필수 안내 문장은 모델이 아니라 서비스 코드가 붙인다.
+
+요청:
+
+```json
+{
+  "tone": "grandma",
+  "pattern": {"pattern_id": "pat_3", "type": "weekday", "condition": {"weekday": 4, "hour_from": 21, "hour_to": 24, "category": "delivery"},
+              "observed": {"hit": 11, "window": 13, "unit": "주"}, "sum_krw": 286000, "chained_sum_krw": 94000},
+  "cause_tags": ["overtime", "stress"],
+  "scheduled_time": "20:00"
+}
+```
+
+응답:
+
+```json
+{
+  "title": "목요일 밤이다",
+  "body": "야근하고 지친 목요일, 13주 중 11주를 배달로 때웠지. 오늘은 냉장고부터 열어 봐라.",
+  "notice": "과거 기록을 참고한 사전 안내이며 새 결제를 감지한 결과가 아닙니다.",
+  "model": "claude-sonnet-5-5", "prompt_version": "a1"
+}
+```
+
+- `notice` 는 항상 같은 문장. 프론트는 body 아래에 그대로 표시한다.
+- title 20자, body 80자 이내. 태그 맥락은 "야근하고 지친"처럼 문구에만 반영하고, 당일 야근 여부를 판정하지 않는다.
+- cause_tags 가 비어 있거나 not_applicable 이면 태그 맥락 없이 패턴 수치만으로 쓴다.
+
+## 9. 환경
 
 - `ANTHROPIC_API_KEY` 는 AI 서비스 쪽에만 둔다. Spring 은 키를 모른다.
 - 의존성: `requirements.txt` (anthropic, fastapi, uvicorn, python-multipart, openpyxl, msoffcrypto-tool).
