@@ -8,6 +8,7 @@ F03 추출기 HTTP 서비스. Spring 백엔드가 호출한다.
   GET  /health                     살아 있는지 + 모델·버전
   POST /extract                    캡처 N장 → job JSON (F03_INTERFACE.md 의 형식)
   POST /extract/retry              실패한 장만 다시 추출하고 원래 job JSON 에 병합해서 돌려줌
+  POST /parse                      은행 앱 거래내역 파일(토스뱅크 xlsx) → 같은 모양의 job JSON (달마다 asset 하나)
 
 설계
   - 동기 응답. 한 장 5~6초, 5장 동시 처리라 10장이면 15초 안팎. Spring 쪽 HTTP 타임아웃은 120초 이상으로.
@@ -28,6 +29,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
 import f03_extraction as f03
+from bank_file_parser import EncryptedFileError, UnsupportedFileError, parse_bank_file, parsed_to_payload
 
 log = logging.getLogger("f03.service")
 
@@ -36,6 +38,8 @@ app = FastAPI(title="F03 추출 서비스", version=f03.EXTRACTOR_VERSION)
 MAX_IMAGES_PER_REQUEST = 20
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 ALLOWED_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
+MAX_FILE_BYTES = 20 * 1024 * 1024
+_RE_MONTHS = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 _RE_SLOT = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 
 
@@ -130,4 +134,40 @@ async def extract_retry(
                         "replace_needed": f03.replace_needed_assets(merged),
                         "max_retry_rounds": f03.MAX_RETRY_ROUNDS}
     log.info("retry slot=%s n=%d status=%s", original.slot_month, len(assets), merged.status)
+    return JSONResponse(payload)
+
+
+@app.post("/parse")
+async def parse_file(
+    file: UploadFile = File(..., description="은행 앱이 내보낸 거래내역 파일 (지금은 토스뱅크 xlsx)"),
+    asset_id: str = Form(..., description="백엔드의 UploadedFile id"),
+    owner_name: str = Form(""),
+    password: str = Form("", description="파일 열기 암호 (토스뱅크 발급 파일은 암호가 걸려 있음). 저장하지 않음"),
+    months: list[str] = Form([], description="돌려줄 달 (YYYY-MM, 반복). 비우면 파일의 모든 달"),
+) -> JSONResponse:
+    """거래내역 파일을 읽어 F03 과 같은 모양의 JSON 을 돌려준다.
+
+    - 잔액·상대 계좌번호·메모·성명 열은 읽지 않는다. 파일은 메모리에서만 처리하고 디스크에 쓰지 않는다.
+    - 응답 assets 는 달마다 하나 (asset_id = "<asset_id>:<YYYY-MM>", slot_month 포함). 각 행은 F03 row 와 같은 필드.
+    - 파일 파싱은 결정적이라 confidence 는 전부 high. 검토 큐에 올릴 플래그는 생기지 않는다 (merchant_missing 제외).
+    """
+    if not asset_id.strip():
+        raise HTTPException(400, "asset_id 가 비어 있습니다")
+    bad = [m for m in months if not _RE_MONTHS.match(m)]
+    if bad:
+        raise HTTPException(400, f"months 형식 오류(YYYY-MM): {bad}")
+    data = await file.read()
+    if len(data) > MAX_FILE_BYTES:
+        raise HTTPException(413, "파일이 너무 큽니다")
+    try:
+        parsed = parse_bank_file(data, file.filename or "", asset_id.strip(), owner_name.strip(), password or None)
+    except EncryptedFileError as e:
+        raise HTTPException(422, str(e))
+    except UnsupportedFileError as e:
+        raise HTTPException(415, str(e))
+    finally:
+        del data
+    payload = parsed_to_payload(parsed, asset_id.strip(), months or None)
+    log.info("parse format=%s rows=%d months=%d skipped=%d", parsed.source_format, len(parsed.rows),
+             len(payload["assets"]), parsed.skipped_rows)
     return JSONResponse(payload)

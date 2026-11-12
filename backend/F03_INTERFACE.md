@@ -146,7 +146,33 @@ curl -X POST http://localhost:8001/extract   -F slot_month=2026-10 -F owner_name
 
 Spring 쪽 흐름: 세션 생성 시 파일 저장 → 슬롯별로 `/extract` 호출 → rows 를 Transaction 으로 저장 → flags 로 검토 큐 구성 → 세션 상태 갱신(EXTRACTING → REVIEWING 또는 PARTIAL_FAILED).
 
-## 5. 환경
+## 5. 거래내역 파일 업로드 (`POST /parse`, 구현됨: `backend/bank_file_parser.py`)
+
+캡처 여러 장 대신 은행 앱이 내보낸 거래내역 파일 한 개로 한 달 이상을 한 번에 넣는 주 경로. 지금은 **토스뱅크 xlsx** 만 지원.
+(토스 앱 → 토스뱅크 계좌 → 관리 → 문서 → 거래내역서 → 엑셀. 발급 파일에는 열기 암호가 걸려 있다.)
+
+| 요청 (multipart/form-data) | 설명 |
+|---|---|
+| `file` | xlsx (20MB 이하) |
+| `asset_id` | 백엔드의 UploadedFile id |
+| `owner_name` | 선택. 본인 계좌 이체 구분용 |
+| `password` | 발급 파일의 열기 암호. 메모리에서만 쓰고 저장·로그하지 않음. 없으면 422 |
+| `months[]` | 선택. 돌려줄 달(YYYY-MM, 반복). 비우면 파일의 모든 달 |
+
+응답은 2절과 같은 모양이고 다음이 다르다.
+
+- `assets` 는 **달마다 하나** (`asset_id = "<asset_id>:<YYYY-MM>"`, `slot_month` 포함). 행이 없는 달은 `skipped` / `NO_ROWS_IN_MONTH`.
+- 최상위에 `source: "file"`, `source_format: "toss_bank_xlsx"`, `parser_version`, `period`(파일의 첫·끝 거래일), `skipped_rows`.
+- 모든 행 `confidence: "high"`, 플래그는 `merchant_missing` 외에 생기지 않음. 검토 큐에 올릴 것이 거의 없다.
+- 읽는 열은 거래 일시·적요·거래 유형·거래 기관·거래 금액뿐. **거래 후 잔액, 상대 계좌번호, 메모, 머리글의 성명·계좌번호는 읽지 않는다.** 파일은 디스크에 쓰지 않는다.
+- kind: 체크카드결제 → expense(양수면 refund), 프로모션입금·이자입금 → income, 내계좌간자동이체 → self_transfer, 자동이체·CMS·지로 → expense, 입금·출금·오픈뱅킹·펌뱅킹 → transfer(상대가 본인이면 self_transfer).
+- 이체류 적요의 사람 이름은 "개인", 캡처 주인은 "본인". 한글 3자 단독·가려진 이름(홍*동)을 사람으로 본다. 2자·4자 상호는 그대로 둔다.
+
+오류: 400(입력), 413(크기), 415(지원하지 않는 형식·머리글 없음), 422(암호 필요 또는 틀림).
+
+같은 달에 캡처와 파일이 둘 다 들어오면 같은 거래가 두 번 생긴다. 백엔드는 (날짜, 금액, 방향) 이 같은 행을 중복 후보로 묶는 기존 로직을 그대로 쓰면 된다.
+
+## 6. 환경
 
 - `ANTHROPIC_API_KEY` 는 AI 서비스 쪽에만 둔다. Spring 은 키를 모른다.
-- 거래내역 파일(엑셀·PDF) 업로드 경로도 같은 서비스에 `POST /parse` 로 추가 예정. 출력 JSON 은 동일 형식 (asset.status 와 rows 만 같고, confidence 는 전부 high).
+- 의존성: `requirements.txt` (anthropic, fastapi, uvicorn, python-multipart, openpyxl, msoffcrypto-tool).

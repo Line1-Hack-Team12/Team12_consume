@@ -114,3 +114,37 @@ def test_job_payload_round_trip():
     assert [a.asset_id for a in back.assets] == ["a", "b"] and len(back.all_rows) == 3
     assert back.assets[1].error_code == "NETWORK_ERROR"
     assert f03.retryable_assets(back) == ["b"]
+
+
+
+# ---- /parse ----
+
+from test_bank_file_parser import _toss_xlsx, ROWS
+
+
+def test_parse_endpoint_returns_month_assets_without_sensitive_values():
+    c = TestClient(service.app)
+    r = c.post("/parse", data={"asset_id": "42", "owner_name": "홍길동", "months": ["2026-10"]},
+               files=[("file", ("토스뱅크_거래내역.xlsx", io.BytesIO(_toss_xlsx(ROWS)),
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "succeeded" and body["source"] == "file"
+    assert [(a["asset_id"], a["slot_month"], len(a["rows"])) for a in body["assets"]] == [("42:2026-10", "2026-10", 9)]
+    for forbidden in ["홍길동", "김철수", "1234567", "110-123", "생활비"]:
+        assert forbidden not in r.text, forbidden
+    row = body["assets"][0]["rows"][0]
+    assert set(row) >= {"id", "date", "time", "merchant", "amount_krw", "direction", "kind", "confidence", "raw_text", "flags"}
+
+
+def test_parse_endpoint_errors():
+    c = TestClient(service.app)
+    ole_magic = bytes.fromhex("d0cf11e0a1b11ae1") + bytes(64)
+    enc = c.post("/parse", data={"asset_id": "1"},
+                 files=[("file", ("a.xlsx", io.BytesIO(ole_magic), "application/octet-stream"))])
+    assert enc.status_code == 422                                  # 암호 필요
+    pdf = c.post("/parse", data={"asset_id": "1"}, files=[("file", ("a.pdf", io.BytesIO(b"%PDF-1.4"), "application/pdf"))])
+    assert pdf.status_code == 415
+    bad_month = c.post("/parse", data={"asset_id": "1", "months": ["2026-13"]},
+                       files=[("file", ("a.xlsx", io.BytesIO(_toss_xlsx(ROWS)), "application/octet-stream"))])
+    assert bad_month.status_code == 400
