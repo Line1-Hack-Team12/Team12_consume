@@ -10,6 +10,7 @@ F03 추출기 HTTP 서비스. Spring 백엔드가 호출한다.
   POST /extract/retry              실패한 장만 다시 추출하고 원래 job JSON 에 병합해서 돌려줌
   POST /parse                      은행 앱 거래내역 파일(토스뱅크 xlsx) → 같은 모양의 job JSON (달마다 asset 하나)
   POST /classify                   가맹점명[] → 카테고리·하위 태그 (F07)
+  POST /narrate                    패턴 수치 → 카드 문장·요약·리포트 (F11·F15·F16). 숫자·증거 id 검증 포함
 
 설계
   - 동기 응답. 한 장 5~6초, 5장 동시 처리라 10장이면 15초 안팎. Spring 쪽 HTTP 타임아웃은 120초 이상으로.
@@ -21,6 +22,8 @@ from __future__ import annotations
 
 import json
 import logging
+
+import anthropic
 import re
 import tempfile
 from pathlib import Path
@@ -33,6 +36,7 @@ from fastapi.responses import JSONResponse
 import f03_extraction as f03
 from bank_file_parser import EncryptedFileError, UnsupportedFileError, parse_bank_file, parsed_to_payload
 import classify as f07
+import narrate as f11
 
 log = logging.getLogger("f03.service")
 
@@ -192,3 +196,24 @@ async def classify_merchants(req: ClassifyRequest) -> JSONResponse:
     results = await f07.classify(req.items)
     log.info("classify n=%d low=%d", len(results), sum(c.confidence == "low" for c in results))
     return JSONResponse(f07.to_payload(results))
+
+
+@app.post("/narrate")
+async def narrate_patterns(req: f11.NarrateRequest) -> JSONResponse:
+    """패턴 수치로 카드 문장·가설 질문·행동 제안·태그 추천·요약·리포트를 만든다 (F03_INTERFACE.md 7절).
+
+    - 문장 속 숫자는 요청 숫자 집합과 대조하고, evidence_transaction_ids 는 그 패턴의 증거 id 부분집합인지 확인한다.
+      어긋나면 1회 교정 재시도, 그래도 틀리면 422 {"error_code": "ANALYSIS_OUTPUT_INVALID", "errors": [...]}.
+    - 모델이 말투를 거부하면 중립 말투로 다시 만들고 응답 tone 이 "neutral" 이 된다.
+    - 모델 호출 자체가 실패하면 502 ANALYSIS_FAILED. 백엔드는 (snapshot_id, tone) 으로 결과를 캐시한다.
+    """
+    try:
+        out = await f11.narrate(req)
+    except f11.NarrateInvalid as e:
+        log.warning("narrate invalid snapshot=%s errors=%d", req.snapshot_id, len(e.errors))
+        raise HTTPException(422, {"error_code": "ANALYSIS_OUTPUT_INVALID", "errors": e.errors})
+    except anthropic.APIError as e:
+        log.warning("narrate api error type=%s", type(e).__name__)
+        raise HTTPException(502, {"error_code": "ANALYSIS_FAILED", "errors": [type(e).__name__]})
+    log.info("narrate snapshot=%s tone=%s cards=%d", req.snapshot_id, out["tone"], len(out["cards"]))
+    return JSONResponse(out)

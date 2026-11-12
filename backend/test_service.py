@@ -166,3 +166,29 @@ def test_classify_endpoint_keeps_order(monkeypatch):
     assert r.json()["items"][0]["subcategory"] == "편의점"
     assert c.post("/classify", json={"items": []}).json()["items"] == []
     assert c.post("/classify", json={"items": [{"kind": "expense"}]}).status_code == 422
+
+
+# ---- /narrate ----
+
+def test_narrate_endpoint_maps_errors(monkeypatch):
+    import narrate as f11
+    from test_narrate import REQ, GOOD
+
+    async def ok(req, client=None):
+        return {**GOOD, "model": "m", "prompt_version": "n1", "tone": req.tone, "snapshot_id": req.snapshot_id}
+
+    monkeypatch.setattr(f11, "narrate", ok)
+    c = TestClient(service.app)
+    r = c.post("/narrate", json=REQ)
+    assert r.status_code == 200 and r.json()["tone"] == "coach" and r.json()["cards"][0]["pattern_id"] == "pat_3"
+
+    async def invalid(req, client=None):
+        raise f11.NarrateInvalid(["cards[pat_3].action: 입력에 없는 숫자 50,000"])
+
+    monkeypatch.setattr(f11, "narrate", invalid)
+    r = c.post("/narrate", json=REQ)
+    assert r.status_code == 422 and r.json()["detail"]["error_code"] == "ANALYSIS_OUTPUT_INVALID"
+    assert "50,000" in r.json()["detail"]["errors"][0]
+
+    assert c.post("/narrate", json={**REQ, "tone": "pirate"}).status_code == 422
+    assert c.post("/narrate", json={**REQ, "want": []}).status_code == 422

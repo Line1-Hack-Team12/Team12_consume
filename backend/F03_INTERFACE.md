@@ -1,6 +1,6 @@
 # AI 서비스 인터페이스 (백엔드 연동용)
 
-이 문서는 Python AI 서비스(`backend/service.py`)의 모든 엔드포인트를 정의한다. 1~6절은 구현됨(추출·파일 파싱·분류), 7~8절은 **계약만 확정**된 상태로 구현 전이다. 백엔드는 7~8절 응답을 목으로 두고 개발하면 된다.
+이 문서는 Python AI 서비스(`backend/service.py`)의 모든 엔드포인트를 정의한다. 1~7절은 구현됨(추출·파일 파싱·분류·설명 생성), 8절은 **계약만 확정**된 상태로 구현 전이다. 백엔드는 8절 응답을 목으로 두고 개발하면 된다.
 
 AI 파트가 제공하는 것: 캡처 이미지 N장 + 슬롯 달 → 거래 후보 JSON. 호출 단위는 "한 세션의 한 슬롯 달".
 코드: `backend/f03_extraction.py` (Python 3.12, Anthropic SDK). 백엔드는 이 JSON 만 알면 된다.
@@ -221,7 +221,7 @@ F07. 가맹점명을 상위 카테고리 7개와 하위 태그로 분류한다. 
 - 모델 오류·거부·스키마 실패는 그 묶음을 other/미분류/low 로 돌려주고 HTTP 500 을 내지 않는다. 분류 실패가 분석을 막지 않게 하기 위해서다. low 는 캐시에 넣지 않으므로 다음 세션에서 다시 시도된다.
 - 백엔드 규칙(F07): 공통 캐시 저장은 confidence high·medium 만. 사용자 수정은 세션별 override 로 저장하고 캐시보다 우선.
 
-## 7. 설명 생성 `POST /narrate` (계약 확정, 구현 전)
+## 7. 설명 생성 `POST /narrate` (구현됨: `backend/narrate.py`)
 
 F11·F15·F16. 백엔드가 계산한 패턴 수치로 카드 문장·가설 질문·행동 제안·태그 추천·총평을 만든다. **숫자와 거래 ID 는 입력을 그대로 쓰고, 서비스가 검증한다.** 말투를 바꿀 때도 같은 요청에 tone 만 바꿔 다시 부른다 (분석 재실행 없음). 백엔드는 (snapshot_id, tone) 으로 결과를 캐시한다.
 
@@ -300,12 +300,15 @@ F11·F15·F16. 백엔드가 계산한 패턴 수치로 카드 문장·가설 질
 
 서비스가 보장하는 것 (백엔드는 저장만 하면 됨):
 
-- `evidence_transaction_ids` 는 요청의 evidence id 부분집합. 없는 id 가 나오면 1회 교정 재시도, 그래도 틀리면 HTTP 422 `ANALYSIS_OUTPUT_INVALID`.
-- 문장에 나오는 금액·횟수는 요청 숫자와 일치 (서비스가 문장의 숫자를 뽑아 대조). 어긋나면 위와 같이 처리.
-- `recommended_tags` 는 F13 허용값(overtime, rain, stress, habit, no_specific_reason) 중 3개. custom 은 추천하지 않는다.
+- `evidence_transaction_ids` 는 **그 패턴의** evidence id 부분집합이고 min(3, 증거 수) 건 이상. chain_transactions 의 id 는 증거로 쓸 수 없다. 어긋나면 오류 목록을 붙여 1회 교정 재시도, 그래도 틀리면 HTTP 422 `{"detail": {"error_code": "ANALYSIS_OUTPUT_INVALID", "errors": ["cards[pat_3].action: 입력에 없는 숫자 50,000 → 문장: ..."]}}`.
+- 문장에 나오는 숫자는 전부 요청 숫자 집합에 있어야 한다. 카드: hit·window·sum_krw·chained_sum_krw·둘의 합·hour_from/to·증거·후속 거래의 금액과 날짜. 요약·리포트: 기간(연·월·슬롯 수)·total_spend_krw·카테고리 합계와 share 를 반올림한 %·월별 합계·limits 수치·구독 월액과 합계, 그리고 모든 카드 숫자. 어긋나면 위와 같이 처리. 반올림("약 29만 원")·비율·평균은 나오지 않는다.
+- `recommended_tags` 는 F13 허용값(overtime, rain, stress, habit, no_specific_reason) 중 정확히 3개. 모델이 중복·허용값 밖·개수 틀림으로 내면 서비스가 패턴 유형별 기본값으로 채워 교정한다 (재시도 사유 아님). custom 은 추천하지 않는다.
+- cards 는 요청 patterns 순서대로 하나씩. want 에 없는 항목은 `cards: []` / `summary_line: null` / `report: null`. 응답에 `snapshot_id` 를 그대로 되돌려 준다.
+- 요청 제한: patterns 최대 10개, evidence_transactions 패턴당 1~10건(id 중복 불가), chain_transactions 최대 10건, pattern_id 중복 불가. 어기면 422 (FastAPI 검증).
+- 모델 호출 자체가 실패(429, 5xx, 네트워크)하면 502 `{"detail": {"error_code": "ANALYSIS_FAILED"}}`. 백엔드는 세션을 실패로 돌리지 말고 재시도 버튼으로 같은 요청을 다시 보내면 된다.
 - observation 은 관찰 사실만("비 오는 날 배달 2건"), 원인 단정 없음. hypothesis_question 은 질문 한 문장, action 은 한 문장.
 - 말투 변환 실패 시 중립 표현으로 대체하고 응답 `tone` 에 "neutral" 을 적는다.
-- 소요: 카드 5장 + 요약 + 리포트 기준 15초 안팎. 백엔드는 세션 상태 ANALYZING 으로 두고 호출.
+- 소요: 카드 3장 + 요약 + 리포트 실측 9~11초 (말투별). 백엔드는 세션 상태 ANALYZING 으로 두고 호출하고 HTTP 타임아웃은 120초 이상.
 
 ## 8. 알림 문구 `POST /notify-copy` (계약 확정, 구현 전)
 
