@@ -346,4 +346,44 @@ F14. 카드 토글을 켜거나 태그를 바꿀 때 알림 미리보기 문구�
 ## 9. 환경
 
 - `ANTHROPIC_API_KEY` 는 AI 서비스 쪽에만 둔다. Spring 은 키를 모른다.
-- 의존성: `requirements.txt` (anthropic, fastapi, uvicorn, python-multipart, openpyxl, msoffcrypto-tool).
+- 의존성: `requirements.txt` (anthropic, fastapi, uvicorn, python-multipart, pillow, openpyxl, msoffcrypto-tool).
+- 환경변수: `ANTHROPIC_API_KEY`(필수), `F03_MODEL`(기본 claude-sonnet-5-5). `F07_MODEL`·`F11_MODEL`·`F14_MODEL` 로 기능별 모델을 바꿀 수 있다. `.env.example` 참고.
+
+### Docker (`backend/Dockerfile`)
+
+이미지에는 `requirements.txt` 와 서비스 코드 6개 파일만 들어간다 (`.dockerignore` 가 .env·samples·truth·결과 json·테스트를 막고, COPY 도 파일을 하나씩 지정). 비루트 사용자 `app` 으로 실행하고 `/health` 로 헬스체크한다. 실측 이미지 211MB, 기동 2초 안팎.
+
+```bash
+docker build -t team12-ai ./backend
+docker run --rm --env-file backend/.env -p 127.0.0.1:8001:8001 team12-ai
+```
+
+docker compose 에 넣을 때의 `ai` 서비스 조각. **`ports:` 가 아니라 `expose:` 를 쓴다.** 이 서비스에는 인증이 없어서 호스트 밖으로 열리면 누구나 이미지를 올리고 API 크레딧을 쓸 수 있다. Spring 컨테이너만 `http://ai:8001` 로 부른다.
+
+```yaml
+services:
+  ai:
+    build: ./backend
+    env_file: ./backend/.env          # ANTHROPIC_API_KEY. 저장소에 없음, 각자 .env.example 을 복사해 채움
+    expose: ["8001"]                  # compose 네트워크 안에서만. 디버깅용으로 열려면 ports: ["127.0.0.1:8001:8001"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8001/health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
+
+  api:                                # Spring
+    build: ./spring
+    ports: ["8080:8080"]
+    environment:
+      AI_BASE_URL: http://ai:8001     # Spring 의 AI 클라이언트 base URL. HTTP 타임아웃 120초 이상
+    depends_on:
+      ai:
+        condition: service_healthy
+```
+
+- 컨테이너는 아무것도 디스크에 남기지 않는다. 업로드 이미지는 요청 동안 `/tmp` 에만 있고 응답 후 지운다. 볼륨이 필요 없다.
+- 로그는 stdout 으로만 나가고 이미지·원문·이름·키를 적지 않는다. `docker logs ai` 로 요청별 건수·상태만 보인다.
+- 서버에 올리면 컨테이너에서 `api.anthropic.com` 으로 나가는 아웃바운드가 열려 있어야 한다. 크레딧이 떨어지면 모든 AI 호출이 502 `ANALYSIS_FAILED`(분류는 other/미분류/low 폴백)로 떨어지므로 시연 전 잔액을 확인한다.
