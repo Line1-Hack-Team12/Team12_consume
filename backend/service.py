@@ -11,6 +11,7 @@ F03 추출기 HTTP 서비스. Spring 백엔드가 호출한다.
   POST /parse                      은행 앱 거래내역 파일(토스뱅크 xlsx) → 같은 모양의 job JSON (달마다 asset 하나)
   POST /classify                   가맹점명[] → 카테고리·하위 태그 (F07)
   POST /narrate                    패턴 수치 → 카드 문장·요약·리포트 (F11·F15·F16). 숫자·증거 id 검증 포함
+  POST /notify-copy                패턴 수치 + 원인 태그 → 알림 제목·본문 (F14). 고정 안내 문장은 서비스가 붙임
 
 설계
   - 동기 응답. 한 장 5~6초, 5장 동시 처리라 10장이면 15초 안팎. Spring 쪽 HTTP 타임아웃은 120초 이상으로.
@@ -37,6 +38,7 @@ import f03_extraction as f03
 from bank_file_parser import EncryptedFileError, UnsupportedFileError, parse_bank_file, parsed_to_payload
 import classify as f07
 import narrate as f11
+import notify as f14
 
 log = logging.getLogger("f03.service")
 
@@ -216,4 +218,22 @@ async def narrate_patterns(req: f11.NarrateRequest) -> JSONResponse:
         log.warning("narrate api error type=%s", type(e).__name__)
         raise HTTPException(502, {"error_code": "ANALYSIS_FAILED", "errors": [type(e).__name__]})
     log.info("narrate snapshot=%s tone=%s cards=%d", req.snapshot_id, out["tone"], len(out["cards"]))
+    return JSONResponse(out)
+
+
+@app.post("/notify-copy")
+async def notify_copy(req: f14.NotifyRequest) -> JSONResponse:
+    """알림 미리보기 문구 (F03_INTERFACE.md 8절). title ≤ 20자, body ≤ 80자, notice 는 항상 같은 문장.
+
+    - 숫자는 pattern 수치만. 길이 초과·숫자 불일치는 1회 교정, 그래도 틀리면 422 ANALYSIS_OUTPUT_INVALID.
+    - cause_tags 가 비어 있거나 not_applicable 이면 태그 맥락 없이 수치만으로 쓴다.
+    """
+    try:
+        out = await f14.notify_copy(req)
+    except f14.NotifyInvalid as e:
+        raise HTTPException(422, {"error_code": "ANALYSIS_OUTPUT_INVALID", "errors": e.errors})
+    except anthropic.APIError as e:
+        log.warning("notify api error type=%s", type(e).__name__)
+        raise HTTPException(502, {"error_code": "ANALYSIS_FAILED", "errors": [type(e).__name__]})
+    log.info("notify pattern=%s tone=%s", req.pattern.pattern_id, out["tone"])
     return JSONResponse(out)

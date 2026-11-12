@@ -1,6 +1,6 @@
 # AI 서비스 인터페이스 (백엔드 연동용)
 
-이 문서는 Python AI 서비스(`backend/service.py`)의 모든 엔드포인트를 정의한다. 1~7절은 구현됨(추출·파일 파싱·분류·설명 생성), 8절은 **계약만 확정**된 상태로 구현 전이다. 백엔드는 8절 응답을 목으로 두고 개발하면 된다.
+이 문서는 Python AI 서비스(`backend/service.py`)의 모든 엔드포인트를 정의한다. 1~8절 전부 구현됨 (추출·파일 파싱·분류·설명 생성·알림 문구). 각 절의 요청·응답 예시는 실제 서비스가 돌려주는 모양과 같다.
 
 AI 파트가 제공하는 것: 캡처 이미지 N장 + 슬롯 달 → 거래 후보 JSON. 호출 단위는 "한 세션의 한 슬롯 달".
 코드: `backend/f03_extraction.py` (Python 3.12, Anthropic SDK). 백엔드는 이 JSON 만 알면 된다.
@@ -310,7 +310,7 @@ F11·F15·F16. 백엔드가 계산한 패턴 수치로 카드 문장·가설 질
 - 말투 변환 실패 시 중립 표현으로 대체하고 응답 `tone` 에 "neutral" 을 적는다.
 - 소요: 카드 3장 + 요약 + 리포트 실측 9~11초 (말투별). 백엔드는 세션 상태 ANALYZING 으로 두고 호출하고 HTTP 타임아웃은 120초 이상.
 
-## 8. 알림 문구 `POST /notify-copy` (계약 확정, 구현 전)
+## 8. 알림 문구 `POST /notify-copy` (구현됨: `backend/notify.py`)
 
 F14. 카드 토글을 켜거나 태그를 바꿀 때 알림 미리보기 문구를 만든다. 필수 안내 문장은 모델이 아니라 서비스 코드가 붙인다.
 
@@ -337,9 +337,11 @@ F14. 카드 토글을 켜거나 태그를 바꿀 때 알림 미리보기 문구�
 }
 ```
 
-- `notice` 는 항상 같은 문장. 프론트는 body 아래에 그대로 표시한다.
-- title 20자, body 80자 이내. 태그 맥락은 "야근하고 지친"처럼 문구에만 반영하고, 당일 야근 여부를 판정하지 않는다.
-- cause_tags 가 비어 있거나 not_applicable 이면 태그 맥락 없이 패턴 수치만으로 쓴다.
+- `notice` 는 항상 같은 문장이고 서비스 코드가 붙인다. 프론트는 body 아래에 그대로 표시한다. 응답에 `pattern_id` 와 `tone` 도 돌려준다 (거부 폴백 시 "neutral").
+- title 20자, body 80자 이내 (공백 포함, 서비스가 길이를 검사). 태그 맥락은 "야근하고 지친"처럼 문구에만 반영하고, 당일 야근 여부를 판정하지 않는다.
+- cause_tags 는 F13 허용값(overtime, rain, stress, habit, no_specific_reason)과 특수 상태(unknown, not_applicable, skipped), custom 만 받는다. 그 외 값은 422. 비어 있거나 not_applicable 이 섞여 있으면 태그 맥락 없이 패턴 수치만으로 쓴다. custom 의 본문은 보내지 않는다 (서비스는 허용값 태그만 문구에 반영).
+- 문구의 숫자는 pattern 수치(hit, window, sum_krw, chained_sum_krw, 둘의 합, hour_from/to)와 scheduled_time 의 숫자만 허용. 조건에 없는 카테고리 단어(주점 패턴에 "배달")도 오류. 길이·숫자·카테고리 오류는 1회 교정, 그래도 틀리면 422 `{"detail": {"error_code": "ANALYSIS_OUTPUT_INVALID", "errors": [...]}}`. 모델 호출 실패는 502 `ANALYSIS_FAILED`.
+- 소요: 실측 2~3초 (가끔 9초). 토글·태그 변경 직후 미리보기라 동기 호출로 충분하다. 같은 (pattern_id, tone, cause_tags) 는 백엔드가 캐시해도 된다.
 
 ## 9. 환경
 

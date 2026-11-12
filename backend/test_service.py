@@ -192,3 +192,25 @@ def test_narrate_endpoint_maps_errors(monkeypatch):
 
     assert c.post("/narrate", json={**REQ, "tone": "pirate"}).status_code == 422
     assert c.post("/narrate", json={**REQ, "want": []}).status_code == 422
+
+
+# ---- /notify-copy ----
+
+def test_notify_copy_endpoint(monkeypatch):
+    import notify as f14
+    from test_notify import REQ, GOOD
+
+    async def ok(req, client=None):
+        return {**GOOD, "notice": f14.NOTICE, "pattern_id": req.pattern.pattern_id, "tone": req.tone, "model": "m", "prompt_version": "a1"}
+
+    monkeypatch.setattr(f14, "notify_copy", ok)
+    c = TestClient(service.app)
+    r = c.post("/notify-copy", json=REQ)
+    assert r.status_code == 200 and r.json()["notice"] == f14.NOTICE and r.json()["title"] == "목요일 밤이다"
+
+    async def invalid(req, client=None):
+        raise f14.NotifyInvalid(["body: 80자 초과 (지금 91자)"])
+
+    monkeypatch.setattr(f14, "notify_copy", invalid)
+    assert c.post("/notify-copy", json=REQ).status_code == 422
+    assert c.post("/notify-copy", json={**REQ, "cause_tags": ["bored"]}).status_code == 422
