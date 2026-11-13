@@ -22,11 +22,15 @@ from typing import Any
 import anthropic
 from pydantic import BaseModel, ValidationError
 
+import llm_common
+from llm_common import first_text as _first_text
+
 log = logging.getLogger("f07.classify")
 
 MODEL = os.environ.get("F07_MODEL", os.environ.get("F03_MODEL", "claude-sonnet-5-5"))
 EFFORT = "low"
 MAX_TOKENS = 6000
+REQUEST_TIMEOUT_SEC = 60.0                 # 100개 묶음 분류는 10초 안팎
 BATCH_SIZE = 100
 PROMPT_VERSION = "c2"
 
@@ -128,20 +132,10 @@ def _user_message(items: list[ClassifyItem]) -> str:
 
 
 async def _call(client: anthropic.AsyncAnthropic, messages: list[dict[str, Any]]) -> anthropic.types.Message:
-    return await client.beta.messages.create(
-        model=MODEL, max_tokens=MAX_TOKENS,
-        betas=["server-side-fallback-2026-07-01"], fallbacks="default",
-        system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-        messages=messages,
-        output_config={"effort": EFFORT, "format": {"type": "json_schema", "schema": CLASSIFY_SCHEMA}},
+    return await llm_common.call_json(
+        client, model=MODEL, max_tokens=MAX_TOKENS, system=SYSTEM_PROMPT, messages=messages,
+        effort=EFFORT, schema=CLASSIFY_SCHEMA, timeout=REQUEST_TIMEOUT_SEC,
     )
-
-
-def _first_text(message: anthropic.types.Message) -> str:
-    for block in message.content:
-        if block.type == "text":
-            return block.text
-    raise ValueError("no text block")
 
 
 async def classify_batch(client: anthropic.AsyncAnthropic, items: list[ClassifyItem]) -> list[Classification]:
@@ -189,20 +183,15 @@ async def classify_batch(client: anthropic.AsyncAnthropic, items: list[ClassifyI
 async def classify(items: list[ClassifyItem], client: anthropic.AsyncAnthropic | None = None,
                    concurrency: int = 3) -> list[Classification]:
     """BATCH_SIZE 단위로 나눠 동시 호출. 순서 보존."""
-    own = client is None
-    client = client or anthropic.AsyncAnthropic(timeout=60.0)
-    sem = asyncio.Semaphore(concurrency)
+    client = client or llm_common.get_client()
+    sem = asyncio.Semaphore(concurrency)                 # 이 요청 안의 상한. 프로세스 전체 상한은 llm_common 이 건다
     batches = [items[i:i + BATCH_SIZE] for i in range(0, len(items), BATCH_SIZE)]
 
     async def run(b: list[ClassifyItem]) -> list[Classification]:
         async with sem:
             return await classify_batch(client, b)
 
-    try:
-        results = await asyncio.gather(*(run(b) for b in batches))
-    finally:
-        if own:
-            await client.close()
+    results = await asyncio.gather(*(run(b) for b in batches))
     return [c for r in results for c in r]
 
 

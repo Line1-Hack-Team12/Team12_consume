@@ -21,6 +21,7 @@ F03 추출기 HTTP 서비스. Spring 백엔드가 호출한다.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -174,7 +175,8 @@ async def parse_file(
     if len(data) > MAX_FILE_BYTES:
         raise HTTPException(413, "파일이 너무 큽니다")
     try:
-        parsed = parse_bank_file(data, file.filename or "", asset_id.strip(), owner_name.strip(), password or None)
+        # 암호 해제·xlsx 읽기는 동기 CPU 작업이라 스레드로 보낸다 (이벤트 루프를 잡으면 그동안 /health 도 멈춘다)
+        parsed = await asyncio.to_thread(parse_bank_file, data, file.filename or "", asset_id.strip(), owner_name.strip(), password or None)
     except EncryptedFileError as e:
         raise HTTPException(422, str(e))
     except UnsupportedFileError as e:

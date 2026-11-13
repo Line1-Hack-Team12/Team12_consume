@@ -348,10 +348,12 @@ F14. 카드 토글을 켜거나 태그를 바꿀 때 알림 미리보기 문구�
 - `ANTHROPIC_API_KEY` 는 AI 서비스 쪽에만 둔다. Spring 은 키를 모른다.
 - 의존성: `requirements.txt` (anthropic, fastapi, uvicorn, python-multipart, pillow, openpyxl, msoffcrypto-tool).
 - 환경변수: `ANTHROPIC_API_KEY`(필수), `F03_MODEL`(기본 claude-sonnet-5-5). `F07_MODEL`·`F11_MODEL`·`F14_MODEL` 로 기능별 모델을 바꿀 수 있다. `.env.example` 참고.
+- `AI_MAX_CONCURRENT_CALLS`(기본 8): 프로세스 전체의 동시 모델 호출 상한. 추출 5장·분류 3묶음 같은 모듈별 상한은 "한 요청 안"의 값이고, 요청이 여러 개 겹치면 이 값이 전체를 묶는다. 429 가 잦으면 내리고, 요청이 밀리면 올린다 (`llm_common.py`).
+- 모델 클라이언트는 프로세스에 하나만 만들어 연결 풀을 공유한다. 파일 파싱·이미지 축소는 스레드로 보내서 긴 작업 중에도 `/health` 가 멈추지 않는다.
 
 ### Docker (`backend/Dockerfile`)
 
-이미지에는 `requirements.txt` 와 서비스 코드 6개 파일만 들어간다 (`.dockerignore` 가 .env·samples·truth·결과 json·테스트를 막고, COPY 도 파일을 하나씩 지정). 비루트 사용자 `app` 으로 실행하고 `/health` 로 헬스체크한다. 실측 이미지 211MB, 기동 2초 안팎.
+이미지에는 `requirements.txt` 와 서비스 코드 7개 파일(`service.py`, `llm_common.py`, `f03_extraction.py`, `bank_file_parser.py`, `classify.py`, `narrate.py`, `notify.py`)만 들어간다 (`.dockerignore` 가 .env·samples·truth·결과 json·테스트를 막고, COPY 도 파일을 하나씩 지정). 비루트 사용자 `app` 으로 실행하고 `/health` 로 헬스체크한다. 실측 이미지 211MB, 기동 2초 안팎.
 
 ```bash
 docker build -t team12-ai ./backend
@@ -386,4 +388,5 @@ services:
 
 - 컨테이너는 아무것도 디스크에 남기지 않는다. 업로드 이미지는 요청 동안 `/tmp` 에만 있고 응답 후 지운다. 볼륨이 필요 없다.
 - 로그는 stdout 으로만 나가고 이미지·원문·이름·키를 적지 않는다. `docker logs ai` 로 요청별 건수·상태만 보인다.
+- 배포: 이 레포의 `.github/workflows/ai-image.yml` 이 main 의 `backend/**` 변경을 Docker Hub `<계정>/line1thon-ai:latest` 로 올리고, `EC2_HOST` 시크릿이 있으면 EC2 의 `~/app` 에서 `docker compose pull ai && up -d ai` 를 실행한다. 필요한 시크릿 4개는 워크플로 파일 머리에 적혀 있다. `ANTHROPIC_API_KEY` 는 EC2 의 `~/app/.env` 에만 둔다.
 - 서버에 올리면 컨테이너에서 `api.anthropic.com` 으로 나가는 아웃바운드가 열려 있어야 한다. 크레딧이 떨어지면 모든 AI 호출이 502 `ANALYSIS_FAILED`(분류는 other/미분류/low 폴백)로 떨어지므로 시연 전 잔액을 확인한다.

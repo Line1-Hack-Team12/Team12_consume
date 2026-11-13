@@ -64,6 +64,7 @@ _RE_MASKED_NAME = re.compile(r"(?<![가-힣])[가-힣]{1,2}[*○●]{1,3}[가-�
 
 
 _RE_LONG_NUMBER = re.compile(r"\d{7,}")
+_RE_SELF_TOKEN = re.compile(r"(?<![가-힣])본인(?![가-힣])")    # "본인", "이체 본인" 은 잡고 "본인부담금" 은 안 잡음
 
 
 def _strip_long_numbers(text: str) -> str:
@@ -208,8 +209,8 @@ def parse_toss_xlsx(data: bytes, asset_id: str, owner_name: str = "", password: 
         kind = _TOSS_KIND_BY_TYPE.get(tx_type, "expense" if direction == "out" else "income")
         if kind == "expense" and direction == "in":
             kind = "refund"                                   # 체크카드결제 양수 = 취소·환불
-        if kind == "transfer" and merchant == "본인":
-            kind = "self_transfer"                             # 오픈뱅킹 등으로 본인 다른 계좌에 보낸 것
+        if kind == "transfer" and _RE_SELF_TOKEN.search(merchant):
+            kind = "self_transfer"                             # 오픈뱅킹 등으로 본인 다른 계좌에 보낸 것 ("이체 본인" 처럼 접두어가 붙어도)
         raw_text = _strip_long_numbers(scrub_sensitive(" | ".join(x for x in (desc, tx_type, org) if x)))
         kind = infer_self_transfer(kind, merchant, raw_text)
 

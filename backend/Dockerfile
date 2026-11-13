@@ -22,7 +22,7 @@ RUN pip install -r requirements.txt \
     && rm -rf /var/lib/apt/lists/*
 
 # 서비스 코드만. 테스트·평가 스크립트·정답 세트는 넣지 않는다
-COPY service.py f03_extraction.py bank_file_parser.py classify.py narrate.py notify.py ./
+COPY service.py llm_common.py f03_extraction.py bank_file_parser.py classify.py narrate.py notify.py ./
 
 # 루트로 돌리지 않는다. 임시 업로드는 /tmp 에만 쓴다
 RUN useradd --create-home --uid 10001 app && chown -R app:app /app

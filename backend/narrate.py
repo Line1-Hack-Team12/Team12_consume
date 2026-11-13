@@ -18,7 +18,10 @@ import re
 from typing import Any, Literal
 
 import anthropic
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, field_validator
+
+import llm_common
+from llm_common import OutputInvalid, parse_or_errors as _parse_or_errors
 
 log = logging.getLogger("f11.narrate")
 
@@ -155,12 +158,8 @@ class NarrateRequest(BaseModel):
         return v
 
 
-class NarrateInvalid(Exception):
+class NarrateInvalid(OutputInvalid):
     """교정 재시도 후에도 출력이 계약을 어김. errors 에 사유 목록."""
-
-    def __init__(self, errors: list[str]):
-        super().__init__("; ".join(errors))
-        self.errors = errors
 
 
 # ---------------------------------------------------------------- 출력 스키마
@@ -321,7 +320,8 @@ def allowed_numbers_pattern(p: Pattern) -> set[float]:
     return nums
 
 
-_RE_NUM = re.compile(r"\d[\d,]*(?:\.\d+)?")
+# 쉼표는 뒤에 숫자 딱 3자리가 올 때만 천 단위 구분자 ("1,000원"). "8,9월" 은 8 과 9 두 숫자
+_RE_NUM = re.compile(r"\d{1,3}(?:,\d{3})+(?!\d)(?:\.\d+)?|\d+(?:\.\d+)?")
 
 
 def numbers_in(text: str) -> list[float]:
@@ -492,80 +492,28 @@ class _ModelOut(BaseModel):
 
 
 async def _call(client: anthropic.AsyncAnthropic, messages: list[dict[str, Any]]) -> anthropic.types.Message:
-    return await client.beta.messages.create(
-        model=MODEL, max_tokens=MAX_TOKENS,
-        betas=["server-side-fallback-2026-07-01"], fallbacks="default",
-        system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-        messages=messages,
-        output_config={"effort": EFFORT, "format": {"type": "json_schema", "schema": NARRATE_SCHEMA}},
+    return await llm_common.call_json(
+        client, model=MODEL, max_tokens=MAX_TOKENS, system=SYSTEM_PROMPT, messages=messages,
+        effort=EFFORT, schema=NARRATE_SCHEMA, timeout=REQUEST_TIMEOUT_SEC,
     )
 
 
-def _first_text(message: anthropic.types.Message) -> str:
-    for block in message.content:
-        if block.type == "text":
-            return block.text
-    raise ValueError("no text block")
-
-
-def _parse_or_errors(message: anthropic.types.Message, model_cls: type[BaseModel]) -> tuple[BaseModel | None, list[str]]:
-    """응답에서 JSON 을 꺼낸다. text 블록이 없거나(max_tokens 로 사고만 하다 끝남) 스키마가 틀리면 오류 목록을 돌려준다."""
-    if message.stop_reason == "max_tokens":
-        return None, ["출력이 길이 제한에 잘렸습니다. 더 짧게 쓰세요"]
-    try:
-        return model_cls.model_validate_json(_first_text(message)), []
-    except (ValueError, ValidationError) as e:
-        return None, [f"출력이 JSON 스키마와 맞지 않습니다 ({type(e).__name__})"]
-
-
-class _Refused(Exception):
-    pass
+_CORRECTION = ("출력이 규칙을 어겼습니다. 아래 항목만 고쳐서 전체 JSON 을 다시 출력하세요. "
+               "숫자는 '쓸 수 있는 숫자' 목록의 값만, 증거 id 는 그 패턴의 증거 거래 id 만 쓰세요.")
 
 
 async def _generate(client: anthropic.AsyncAnthropic, req: NarrateRequest, tone: str) -> dict[str, Any]:
-    """한 말투로 생성 + 검증. 검증 실패 시 오류 목록을 돌려주며 1회 교정. 그래도 실패면 NarrateInvalid."""
-    messages: list[dict[str, Any]] = [{"role": "user", "content": _render_request(req, tone)}]
-    last_errors: list[str] = []
-    for attempt in range(2):
-        msg = await _call(client, messages)
-        if msg.stop_reason == "refusal":
-            raise _Refused()
-        parsed, errors = _parse_or_errors(msg, _ModelOut)
-        fixed: dict[str, Any] = {}
-        if parsed is not None:
-            fixed, errors = validate_output(req, parsed.model_dump())
-        if not errors:
-            log.info("narrate ok tone=%s attempt=%d cards=%d", tone, attempt + 1, len(fixed["cards"]))
-            return fixed
-        last_errors = errors
-        log.warning("narrate invalid tone=%s attempt=%d errors=%d", tone, attempt + 1, len(errors))
-        if attempt == 0:
-            messages = messages + [
-                {"role": "assistant", "content": msg.content},
-                {"role": "user", "content": "출력이 규칙을 어겼습니다. 아래 항목만 고쳐서 전체 JSON 을 다시 출력하세요. "
-                                            "숫자는 '쓸 수 있는 숫자' 목록의 값만, 증거 id 는 그 패턴의 증거 거래 id 만 쓰세요.\n- "
-                                            + "\n- ".join(errors)},
-            ]
-    raise NarrateInvalid(last_errors)
+    """한 말투로 생성 + 검증. 검증 실패 시 오류 목록을 돌려주며 1회 교정. 그래도 실패면 NarrateInvalid. 거부는 llm_common.Refused."""
+    return await llm_common.generate_validated(
+        lambda messages: _call(client, messages),
+        [{"role": "user", "content": _render_request(req, tone)}],
+        _ModelOut, lambda out: validate_output(req, out), _CORRECTION, f"narrate tone={tone}", NarrateInvalid,
+    )
 
 
 async def narrate(req: NarrateRequest, client: anthropic.AsyncAnthropic | None = None) -> dict[str, Any]:
     """요청 말투로 생성. 모델이 거부하면 중립 말투로 한 번 더 시도하고 tone='neutral' 로 표시."""
-    own = client is None
-    client = client or anthropic.AsyncAnthropic(timeout=REQUEST_TIMEOUT_SEC)
-    try:
-        tone = req.tone
-        try:
-            out = await _generate(client, req, tone)
-        except _Refused:
-            log.warning("narrate refused tone=%s → neutral", tone)
-            tone = "neutral"
-            try:
-                out = await _generate(client, req, tone)
-            except _Refused:
-                raise NarrateInvalid(["모델이 생성을 거부했습니다 (중립 말투로도)"])
-    finally:
-        if own:
-            await client.close()
+    client = client or llm_common.get_client()
+    out, tone = await llm_common.with_neutral_fallback(lambda t: _generate(client, req, t), req.tone, "narrate", NarrateInvalid)
     out.update({"model": MODEL, "prompt_version": PROMPT_VERSION, "tone": tone, "snapshot_id": req.snapshot_id})
     return out

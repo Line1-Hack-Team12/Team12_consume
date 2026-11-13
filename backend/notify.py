@@ -18,7 +18,9 @@ from typing import Any, Literal
 import anthropic
 from pydantic import BaseModel, Field, field_validator
 
-from narrate import (TAGS, TYPE_KO, PATTERN_TYPES, Observed, NarrateInvalid, _fmt_num, _nums_from_date, _parse_or_errors,
+import llm_common
+
+from narrate import (TAGS, TYPE_KO, PATTERN_TYPES, Observed, NarrateInvalid, _fmt_num, _nums_from_date,
                      describe_condition, numbers_in)
 
 log = logging.getLogger("f14.notify")
@@ -168,59 +170,27 @@ class _ModelOut(BaseModel):
     body: str
 
 
-class _Refused(Exception):
-    pass
-
-
 async def _call(client: anthropic.AsyncAnthropic, messages: list[dict[str, Any]]) -> anthropic.types.Message:
-    return await client.beta.messages.create(
-        model=MODEL, max_tokens=MAX_TOKENS,
-        betas=["server-side-fallback-2026-07-01"], fallbacks="default",
-        system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-        messages=messages,
-        output_config={"effort": EFFORT, "format": {"type": "json_schema", "schema": NOTIFY_SCHEMA}},
+    return await llm_common.call_json(
+        client, model=MODEL, max_tokens=MAX_TOKENS, system=SYSTEM_PROMPT, messages=messages,
+        effort=EFFORT, schema=NOTIFY_SCHEMA, timeout=REQUEST_TIMEOUT_SEC,
     )
 
 
-async def _generate(client: anthropic.AsyncAnthropic, req: NotifyRequest, tone: str) -> dict[str, str]:
-    messages: list[dict[str, Any]] = [{"role": "user", "content": _render_request(req, tone)}]
-    last: list[str] = []
-    for attempt in range(2):
-        msg = await _call(client, messages)
-        if msg.stop_reason == "refusal":
-            raise _Refused()
-        parsed, errors = _parse_or_errors(msg, _ModelOut)
-        fixed: dict[str, str] = {}
-        if parsed is not None:
-            fixed, errors = validate_output(req, parsed.model_dump())
-        if not errors:
-            return fixed
-        last = errors
-        log.warning("notify invalid tone=%s attempt=%d errors=%s", tone, attempt + 1, errors)   # 길이·숫자 사유만, 문장 없음
-        if attempt == 0:
-            messages = messages + [
-                {"role": "assistant", "content": msg.content},
-                {"role": "user", "content": "출력이 규칙을 어겼습니다. 아래를 고쳐서 JSON 을 다시 출력하세요.\n- " + "\n- ".join(errors)},
-            ]
-    raise NotifyInvalid(last)
+_CORRECTION = "출력이 규칙을 어겼습니다. 아래를 고쳐서 JSON 을 다시 출력하세요."
+
+
+async def _generate(client: anthropic.AsyncAnthropic, req: NotifyRequest, tone: str) -> dict[str, Any]:
+    """생성 + 검증 + 1회 교정. 실패면 NotifyInvalid, 거부는 llm_common.Refused. (narrate 와 같은 흐름, llm_common 에 있음)"""
+    return await llm_common.generate_validated(
+        lambda messages: _call(client, messages),
+        [{"role": "user", "content": _render_request(req, tone)}],
+        _ModelOut, lambda out: validate_output(req, out), _CORRECTION, f"notify tone={tone}", NotifyInvalid,
+    )
 
 
 async def notify_copy(req: NotifyRequest, client: anthropic.AsyncAnthropic | None = None) -> dict[str, Any]:
-    own = client is None
-    client = client or anthropic.AsyncAnthropic(timeout=REQUEST_TIMEOUT_SEC)
-    try:
-        tone = req.tone
-        try:
-            out = await _generate(client, req, tone)
-        except _Refused:
-            log.warning("notify refused tone=%s → neutral", tone)
-            tone = "neutral"
-            try:
-                out = await _generate(client, req, tone)
-            except _Refused:
-                raise NotifyInvalid(["모델이 생성을 거부했습니다 (중립 말투로도)"])
-    finally:
-        if own:
-            await client.close()
+    client = client or llm_common.get_client()
+    out, tone = await llm_common.with_neutral_fallback(lambda t: _generate(client, req, t), req.tone, "notify", NotifyInvalid)
     return {**out, "notice": NOTICE, "pattern_id": req.pattern.pattern_id, "tone": tone,
             "model": MODEL, "prompt_version": PROMPT_VERSION}

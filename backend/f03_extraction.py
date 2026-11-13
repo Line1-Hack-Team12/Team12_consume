@@ -49,6 +49,9 @@ from typing import Any, Literal
 import anthropic
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
+import llm_common
+from llm_common import first_text as _first_text
+
 # Pillow는 "있으면 축소, 없으면 원본 그대로" 로 동작합니다. 10MB 캡처를 그대로 보내면
 # API 이미지 한도에 걸릴 수 있으니 실제 서비스에서는 설치를 권장합니다.
 try:
@@ -366,36 +369,16 @@ def _build_messages(media_type: str, b64: str, slot_month: str, owner_name: str 
 
 async def _call_model(client: anthropic.AsyncAnthropic, messages: list[dict[str, Any]]) -> anthropic.types.Message:
     """
-    Claude 호출 한 번. 여기서 정한 것들:
+    Claude 호출 한 번 (공통 옵션은 llm_common.call_json 에 있음). 여기서 정한 것들:
 
     - model/effort        : Sonnet 5.5 는 사고(thinking)가 기본으로 켜져 있어서 따로 끄지 않고
                             effort 만 low 로 내립니다. ({"type": "disabled"} 는 이 모델에서 400)
     - output_config.format: JSON 스키마를 지정하면 첫 text 블록이 항상 스키마에 맞는 JSON 입니다.
-    - fallbacks="default" : 안전 분류기가 요청을 거부하면 서버가 다른 모델로 한 번 더 시도합니다.
-                            Claude API 전용 베타라 Bedrock/Vertex 로 옮기면 이 두 줄은 빼야 합니다.
-    - cache_control       : 시스템 프롬프트를 캐시합니다. 같은 프롬프트로 여러 장을 보내므로
-                            두 번째 호출부터는 입력 비용이 크게 줄어듭니다.
     """
-    return await client.beta.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        betas=["server-side-fallback-2026-07-01"],
-        fallbacks="default",
-        system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
-        messages=messages,
-        output_config={
-            "effort": EFFORT,
-            "format": {"type": "json_schema", "schema": EXTRACTION_SCHEMA},
-        },
+    return await llm_common.call_json(
+        client, model=MODEL, max_tokens=MAX_TOKENS, system=SYSTEM_PROMPT, messages=messages,
+        effort=EFFORT, schema=EXTRACTION_SCHEMA, timeout=REQUEST_TIMEOUT_SEC,
     )
-
-
-def _first_text(message: anthropic.types.Message) -> str:
-    """응답에서 첫 text 블록을 꺼냅니다. (사고 블록이 앞에 올 수 있으니 type 으로 찾습니다)"""
-    for block in message.content:
-        if block.type == "text":
-            return block.text
-    raise ValueError("no text block in response")
 
 
 def _usage_dict(message: anthropic.types.Message) -> dict[str, int]:
@@ -424,7 +407,8 @@ async def extract_one(
     result = AssetExtraction(asset_id=asset_id, status="failed")
 
     try:
-        media_type, b64 = prepare_image(image_path)
+        # 파일 읽기·축소·base64 는 CPU 작업이라 스레드로 보낸다. 이벤트 루프를 잡고 있으면 그동안 /health 도 멈춘다
+        media_type, b64 = await asyncio.to_thread(prepare_image, image_path)
     except Exception as e:  # 깨진 파일, 지원하지 않는 형식
         result.error_code, result.error_message = "UNSUPPORTED_MEDIA", str(e)
         return result
@@ -843,10 +827,9 @@ async def run_extraction_job(
     - 세마포어로 동시 요청 수를 제한해 429 를 피합니다.
     - 결과는 자산별로 모으고, 전체 상태를 succeeded / partial / failed 로 정리합니다.
     """
-    own_client = client is None
-    client = client or anthropic.AsyncAnthropic(timeout=REQUEST_TIMEOUT_SEC)
+    client = client or llm_common.get_client()          # 프로세스 공용. 요청마다 만들지 않고 닫지도 않는다
     job_id = f"job_{uuid.uuid4().hex[:8]}"
-    sem = asyncio.Semaphore(concurrency)
+    sem = asyncio.Semaphore(concurrency)                 # 이 작업 안의 상한. 프로세스 전체 상한은 llm_common 이 건다
 
     async def guarded(asset_id: str, path: Path) -> AssetExtraction:
         async with sem:
@@ -858,18 +841,14 @@ async def run_extraction_job(
                 return AssetExtraction(asset_id=asset_id, status="failed",
                                        error_code="INTERNAL", error_message=type(e).__name__)
 
-    try:
-        results: list[AssetExtraction] = []
-        if assets:
-            # 1) 캐시 워밍: 첫 장은 단독으로
-            results.append(await guarded(*assets[0]))
-            # 2) 나머지는 동시에
-            if len(assets) > 1:
-                rest = await asyncio.gather(*(guarded(a, p) for a, p in assets[1:]))
-                results.extend(rest)
-    finally:
-        if own_client:
-            await client.close()
+    results: list[AssetExtraction] = []
+    if assets:
+        # 1) 캐시 워밍: 첫 장은 단독으로
+        results.append(await guarded(*assets[0]))
+        # 2) 나머지는 동시에
+        if len(assets) > 1:
+            rest = await asyncio.gather(*(guarded(a, p) for a, p in assets[1:]))
+            results.extend(rest)
 
     status = job_status(results)
 
