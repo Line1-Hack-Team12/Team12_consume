@@ -294,7 +294,7 @@ F11·F15·F16. 백엔드가 계산한 패턴 수치로 카드 문장·가설 질
     "actions": ["...", "..."],
     "limits_sentence": "업로드가 없는 날 4일과 시각이 없는 거래 12건은 시간대 분석에서 빠졌어요."
   },
-  "model": "claude-sonnet-5-5", "prompt_version": "n1", "tone": "coach"
+  "model": "claude-sonnet-5-5", "prompt_version": "n2", "tone": "coach"
 }
 ```
 

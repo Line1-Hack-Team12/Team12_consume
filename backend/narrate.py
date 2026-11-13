@@ -25,7 +25,7 @@ log = logging.getLogger("f11.narrate")
 MODEL = os.environ.get("F11_MODEL", os.environ.get("F03_MODEL", "claude-sonnet-5-5"))
 EFFORT = "medium"
 MAX_TOKENS = 8000
-PROMPT_VERSION = "n1"
+PROMPT_VERSION = "n2"
 REQUEST_TIMEOUT_SEC = 90.0
 
 TONES = ("coach", "friend", "grandma")
@@ -221,6 +221,8 @@ SYSTEM_PROMPT = """당신은 소비 기록 분석 서비스의 글쓰기 담당�
 - recommended_tags 는 overtime(야근), rain(비 와서), stress(스트레스), habit(습관), no_specific_reason(그냥) 중 이 패턴 조건에 어울리는 3개.
 - "유의하다", "확률", "통계적으로" 같은 말은 쓰지 않습니다. 횟수를 그대로 보여주는 것이 이 서비스의 방식입니다.
 - 사람 이름·계좌·잔액은 입력에 없고 출력에도 쓰지 않습니다. 가맹점명은 입력 표기 그대로.
+- 패턴을 부를 때는 분류 이름("기타·여가 결제")보다 증거 거래의 가맹점이 말해 주는 것을 씁니다. 증거가 PC방들이면 "PC방",
+  배달 앱들이면 "배달", 술집이면 "술자리" 처럼 사람이 쓰는 말로. 가맹점이 여러 종류면 그때 분류 이름을 씁니다.
 
 말투 (표현만 바뀌고 사실·숫자·id 는 같아야 합니다)
 - coach: 담백한 코치. 존댓말, 판단 없이 사실과 다음 행동. "~했어요", "~해 보세요".
