@@ -1,0 +1,21 @@
+# .env
+.env
+
+# Python
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# F03 실행 산출물·샘플 캡처 (실제 금융 화면이므로 저장소에 올리지 않음)
+backend/extraction_result.json
+backend/captures/
+backend/samples/
+backend/truth/
+backend/*_result*.json
+backend/report_*.json
+
+# 내부 문서 (깃허브 미공개)
+function.md
+prototype.html
+PRD_*.md
+*.docx
