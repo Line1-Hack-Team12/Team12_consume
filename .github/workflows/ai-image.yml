@@ -18,6 +18,9 @@ on:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    env:
+      # 스텝 if 에서는 secrets 를 직접 못 쓰므로 env 로 옮겨서 검사한다
+      EC2_HOST: ${{ secrets.EC2_HOST }}
 
     steps:
       - name: Checkout code
@@ -37,7 +40,7 @@ jobs:
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/line1thon-ai:latest
 
       - name: Deploy ai service to EC2 via SSH
-        if: ${{ secrets.EC2_HOST != '' }}
+        if: ${{ env.EC2_HOST != '' }}
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
