@@ -147,3 +147,18 @@ def test_corrupt_or_legacy_files_map_to_contract_errors():
         parse_bank_file(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64, "a.xls", "f1", password="x")
     with pytest.raises(EncryptedFileError):                        # OLE 헤더인데 암호화 파일이 아님 → msoffcrypto 예외도 422 로
         parse_bank_file(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64, "a.xlsx", "f1", password="x")
+
+
+def test_self_token_with_prefix_is_self_transfer_but_compound_word_is_not():
+    rows = [
+        ("2026.10.19 10:00:00", "이체 홍길동", "오픈뱅킹", "KB국민은행", "", -50000, 900000, ""),   # 치환 후 "이체 본인"
+        ("2026.10.18 10:00:00", "홍길동", "오픈뱅킹", "", "", -20000, 880000, ""),                # 정확히 "본인"
+        ("2026.10.17 10:00:00", "본인부담금 정산", "오픈뱅킹", "", "", -3000, 877000, ""),         # 복합어는 아님
+        ("2026.10.16 10:00:00", "이체 김철수", "오픈뱅킹", "", "", -7000, 870000, ""),             # 타인 → 개인, transfer
+    ]
+    p = parse_toss_xlsx(_toss_xlsx(rows), "f9", owner_name="홍길동")
+    by_amount = {r.amount_krw: r for r in p.rows}
+    assert by_amount[50000].kind == "self_transfer" and by_amount[50000].merchant == "이체 본인"
+    assert by_amount[20000].kind == "self_transfer"
+    assert by_amount[3000].kind == "transfer"
+    assert by_amount[7000].kind == "transfer"                 # 타인은 승격하지 않음

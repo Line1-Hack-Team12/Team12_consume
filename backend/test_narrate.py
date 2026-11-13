@@ -195,3 +195,11 @@ def test_no_text_block_or_truncation_is_corrected_once_then_invalid():
     assert out["cards"][0]["pattern_id"] == "pat_3" and "잘렸습니다" in fake.calls[1]["messages"][-1]["content"]
     with pytest.raises(NarrateInvalid):
         asyncio.run(nr.narrate(_req(), client=FakeClient([thinking_only, thinking_only])))
+
+
+def test_numbers_in_treats_comma_as_thousands_only_before_three_digits():
+    assert numbers_in("8,9월") == [8.0, 9.0]
+    assert numbers_in("1,000원") == [1000.0]
+    assert numbers_in("12,345,678원") == [12345678.0]
+    assert numbers_in("13주 중 6회") == [13.0, 6.0]
+    assert numbers_in("10,11,12월에 2,500원") == [10.0, 11.0, 12.0, 2500.0]
