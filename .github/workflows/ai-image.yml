@@ -46,6 +46,7 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true   # 중간 명령(pull 등)이 실패하면 워크플로도 실패로 표시
           script: |
             cd ~/app
             docker compose pull ai
