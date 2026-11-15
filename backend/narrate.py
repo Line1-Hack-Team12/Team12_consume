@@ -28,7 +28,7 @@ log = logging.getLogger("f11.narrate")
 MODEL = os.environ.get("F11_MODEL", os.environ.get("F03_MODEL", "claude-sonnet-5-5"))
 EFFORT = "medium"
 MAX_TOKENS = 8000
-PROMPT_VERSION = "n2"
+PROMPT_VERSION = "n3"
 REQUEST_TIMEOUT_SEC = 90.0
 
 TONES = ("coach", "friend", "grandma")
@@ -232,8 +232,9 @@ SYSTEM_PROMPT = """당신은 소비 기록 분석 서비스의 글쓰기 담당�
 
 생성 범위
 - cards: 패턴마다 카드 하나, 입력 순서대로. 요청에 없는 패턴 카드를 만들지 않습니다.
-- summary_line: 결과 홈 맨 위 한 줄. 가장 큰 반복 지출 하나를 짚습니다.
-- report: overview 는 3문장 이내(기간·합계·가장 큰 관찰), observations 는 패턴마다 한 문장(카드 observation 과 같은 사실을 다른 문장으로),
+- summary_line: 결과 홈 맨 위 한 줄. "합계 최대" 로 표시된 패턴 하나만 짚고, 그 패턴의 합계(직접+후속) 금액을 반드시 씁니다.
+  다른 패턴을 "가장 크다/제일 크다" 고 쓰지 않습니다 (카드 목록 1위와 요약이 어긋나면 안 됩니다).
+- report: overview 는 3문장 이내(기간·합계·"합계 최대" 패턴의 관찰), observations 는 패턴마다 한 문장(카드 observation 과 같은 사실을 다른 문장으로),
   actions 는 1~3개, limits_sentence 는 한계 수치(업로드 없는 날, 시각 없는 거래, 날씨 생략)를 한 문장으로.
 - want 에 없는 항목은 cards=[] / summary_line=null / report=null 로 둡니다."""
 
@@ -334,14 +335,23 @@ def numbers_in(text: str) -> list[float]:
     return out
 
 
+def top_pattern(req: NarrateRequest) -> Pattern | None:
+    """합계(직접+후속)가 가장 큰 패턴. 같으면 입력 순서가 앞선 것. summary_line 과 overview 의 '가장 큰 반복' 기준."""
+    if not req.patterns:
+        return None
+    return max(req.patterns, key=lambda p: p.sum_krw + p.chained_sum_krw)
+
+
 def _render_request(req: NarrateRequest, tone: str) -> str:
+    top = top_pattern(req)
     L: list[str] = []
     L.append(f"말투: {tone}")
     L.append(f"생성할 것(want): {', '.join(req.want)}")
     L.append(f"기간: {req.period.start} ~ {req.period.end} (슬롯 {len(req.period.slots)}개: {', '.join(req.period.slots)})")
     L.append("")
     for i, p in enumerate(req.patterns, 1):
-        L.append(f"[패턴 {i}] pattern_id={p.pattern_id} 유형={TYPE_KO.get(p.type, p.type)}({p.type}) 근거등급={p.evidence_grade}")
+        mark = "  ← 합계 최대: summary_line 과 report overview 의 '가장 큰 반복' 은 이 패턴" if p is top else ""
+        L.append(f"[패턴 {i}] pattern_id={p.pattern_id} 유형={TYPE_KO.get(p.type, p.type)}({p.type}) 근거등급={p.evidence_grade}{mark}")
         L.append(f"  조건: {describe_condition(p.type, p.condition)}")
         L.append(f"  관찰: {p.observed.window}{p.observed.unit} 중 {p.observed.hit}회")
         L.append(f"  직접 비용 {_won(p.sum_krw)}, 후속 비용 {_won(p.chained_sum_krw)}, 합계 {_won(p.sum_krw + p.chained_sum_krw)}")
@@ -448,6 +458,11 @@ def validate_output(req: NarrateRequest, out: dict[str, Any]) -> tuple[dict[str,
         if not line:
             errors.append("summary_line: 비어 있음")
         _check_numbers("summary_line", line, glob | all_pattern_nums, errors)
+        top = top_pattern(req)
+        if line and top is not None:
+            total = top.sum_krw + top.chained_sum_krw
+            if f"{total:,}" not in line and str(total) not in line:
+                errors.append(f"summary_line: 합계가 가장 큰 패턴({top.pattern_id}) 의 합계 {_won(total)} 을 포함해야 함 → 문장: {line[:80]}")
         fixed["summary_line"] = line
 
     if "report" in req.want:

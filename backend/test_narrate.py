@@ -64,7 +64,7 @@ GOOD = {
         "recommended_tags": ["overtime", "stress", "habit"],
         "evidence_transaction_ids": ["tx_a", "tx_b", "tx_c"],
     }],
-    "summary_line": "지난 3개월, 목요일 밤 배달이 가장 큰 반복 지출이었어요.",
+    "summary_line": "지난 3개월, 목요일 밤 배달이 합계 380,000원으로 가장 큰 반복 지출이었어요.",
     "report": {
         "overview": ["8월부터 10월까지 총 1,243,500원을 썼어요.", "가장 큰 반복은 목요일 밤 배달 286,000원이에요."],
         "observations": [{"pattern_id": "pat_3", "sentence": "목요일 밤 배달이 13주 중 11주 있었어요."}],
@@ -138,6 +138,23 @@ def test_tags_are_corrected_not_rejected():
     bad["cards"][0]["recommended_tags"] = ["stress", "custom"]
     fixed, errors = validate_output(_req(), bad)
     assert errors == [] and len(fixed["cards"][0]["recommended_tags"]) == 3
+
+
+def test_summary_line_must_cite_top_pattern_total():
+    # 1위 패턴(합계 286,000 + 94,000 = 380,000) 의 합계가 없으면 오류 → 교정 재시도 대상
+    out = copy.deepcopy(GOOD)
+    out["summary_line"] = "지난 3개월, 목요일 밤 배달이 가장 큰 반복 지출이었어요."
+    fixed, errors = validate_output(_req(), out)
+    assert any(e.startswith("summary_line") and "380,000" in e for e in errors)
+    # 합계를 쓰면 통과
+    out["summary_line"] = "목요일 밤 배달이 13주 중 11회, 합계 380,000원으로 가장 커요."
+    fixed, errors = validate_output(_req(), out)
+    assert errors == []
+
+
+def test_render_marks_top_pattern_for_summary():
+    text = nr._render_request(_req(), "coach")
+    assert "합계 최대" in text
 
 
 def test_want_limits_what_is_validated_and_returned():

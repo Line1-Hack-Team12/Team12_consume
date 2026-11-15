@@ -23,8 +23,8 @@ AI 파트가 제공하는 것: 캡처 이미지 N장 + 슬롯 달 → 거래 후
   "slot_month": "2026-10",
   "status": "succeeded",
   "model": "claude-sonnet-5-5",
-  "extractor_version": "f03-0.10",
-  "prompt_version": "p7",
+  "extractor_version": "f03-0.11",
+  "prompt_version": "p9",
   "assets": [
     {
       "asset_id": "17",
@@ -294,7 +294,7 @@ F11·F15·F16. 백엔드가 계산한 패턴 수치로 카드 문장·가설 질
     "actions": ["...", "..."],
     "limits_sentence": "업로드가 없는 날 4일과 시각이 없는 거래 12건은 시간대 분석에서 빠졌어요."
   },
-  "model": "claude-sonnet-5-5", "prompt_version": "n2", "tone": "coach"
+  "model": "claude-sonnet-5-5", "prompt_version": "n3", "tone": "coach"
 }
 ```
 
