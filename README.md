@@ -3,7 +3,7 @@
 1호선톤 해커톤(주제: AI를 통한 학습과 성장) Team12 의 **AI 서비스 저장소**다. 사용자가 올린 은행·카드 앱 캡처와 거래내역 파일에서 거래를 뽑아 내고, 카테고리를 붙이고, 반복되는 소비 패턴을 사람 말로 설명하고, 그 시간이 오기 전에 알려 주는 문구를 만든다.
 
 - 서비스(프론트): https://team12-consume.vercel.app
-- 저장소: [AI (이 레포)](https://github.com/Line1-Hack-Team12/Team12_consume) · [프론트](https://github.com/Line1-Hack-Team12/Team12_consume_FE) · [백엔드](https://github.com/Line1-Hack-Team12/Team12_BE)
+- 저장소: [AI](https://github.com/Line1-Hack-Team12/Team12_consume) · [프론트](https://github.com/Line1-Hack-Team12/Team12_consume_FE) · [백엔드](https://github.com/Line1-Hack-Team12/Team12_BE)
 
 ## 무엇을 하나
 
